@@ -24,7 +24,8 @@ SEND_INTERVAL = max(30, int(os.getenv("SEND_INTERVAL", "30")))
 PROMO_TEXT_FILE = Path(os.getenv("PROMO_TEXT_FILE", "promo.txt"))
 PROMO_IMAGE_FILE = Path(os.getenv("PROMO_IMAGE_FILE", "promo.jpg"))
 TARGETS_FILE = Path(os.getenv("TARGETS_FILE", "targets.txt"))
-PROMO_MESSAGE_ID_FILE = Path(os.getenv("PROMO_MESSAGE_ID_FILE", "promo_message_id.txt"))
+PROMO1_MESSAGE_ID_FILE = Path(os.getenv("PROMO1_MESSAGE_ID_FILE", "promo1_message_id.txt"))
+PROMO2_MESSAGE_ID_FILE = Path(os.getenv("PROMO2_MESSAGE_ID_FILE", "promo2_message_id.txt"))
 AUTO_SEND_ENABLED_FILE = Path(os.getenv("AUTO_SEND_ENABLED_FILE", "auto_send_enabled.txt"))
 SCHEDULE_FILE = Path(os.getenv("SCHEDULE_FILE", "schedule.txt"))
 KST = ZoneInfo("Asia/Seoul")
@@ -34,7 +35,7 @@ DEFAULT_SCHEDULE = os.getenv("AUTO_SEND_SCHEDULE", "times:00:00,06:00,12:00,18:0
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 send_task = None
 stop_requested = False
-waiting_for_promo = False
+waiting_for_promo = None
 scheduler_task = None
 
 
@@ -50,11 +51,12 @@ def read_promo_text() -> str:
     return text
 
 
-def read_promo_message_id():
-    if not PROMO_MESSAGE_ID_FILE.exists():
+def read_message_id(path: Path):
+    if not path.exists():
         return None
-    value = PROMO_MESSAGE_ID_FILE.read_text(encoding="utf-8").strip()
+    value = path.read_text(encoding="utf-8").strip()
     return int(value) if value.isdigit() else None
+
 
 
 def is_auto_send_enabled() -> bool:
@@ -135,68 +137,89 @@ def next_auto_run(now: datetime | None = None) -> datetime:
     )
 
 
-async def get_saved_promo_message():
-    message_id = read_promo_message_id()
+async def get_saved_promo_message(path: Path, label: str):
+    message_id = read_message_id(path)
     if not message_id:
         return None
     message = await client.get_messages("me", ids=message_id)
     if not message:
-        raise ValueError("저장한 홍보 메시지를 찾을 수 없습니다. /setpromo로 다시 저장하세요.")
+        raise ValueError(f"{label} 메시지를 찾을 수 없습니다. 다시 저장하세요.")
     return message
 
 
-async def send_saved_promo(entity, message):
-    """사진 전송이 금지된 그룹이면 같은 문구를 텍스트로 자동 재전송합니다."""
-    text = message.message or ""
-    entities = message.entities or None
 
-    if message.media:
-        try:
-            await client.send_file(
-                entity,
-                message.media,
-                caption=text or None,
-                formatting_entities=entities,
-            )
-            return "media"
-        except RPCError as media_exc:
-            if not text:
-                raise media_exc
-            logger.info("미디어 전송 실패, 텍스트로 전환: %s", media_exc)
-            await client.send_message(
-                entity,
-                text,
-                formatting_entities=entities,
-                link_preview=True,
-            )
-            return "text-fallback"
-
+async def send_text_promo(entity, message):
+    text_value = message.message or ""
+    if not text_value:
+        raise ValueError("텍스트 전용 홍보 메시지에 문구가 없습니다.")
     await client.send_message(
         entity,
-        text,
-        formatting_entities=entities,
+        text_value,
+        formatting_entities=message.entities or None,
         link_preview=True,
     )
     return "text"
 
 
-async def send_to_entity(entity, saved_promo, text, image_exists):
-    """저장 메시지 또는 파일 방식으로 발송하고, 사진 제한 시 텍스트로 자동 전환합니다."""
-    if saved_promo:
-        return await send_saved_promo(entity, saved_promo)
+async def send_dual_promo(entity, promo1, promo2):
+    """사진+텍스트를 먼저 보내고, 사진 제한 시 텍스트 전용 홍보로 전환합니다."""
+    promo1_text = promo1.message or ""
+    promo1_entities = promo1.entities or None
+
+    if promo1.media:
+        try:
+            await client.send_file(
+                entity,
+                promo1.media,
+                caption=promo1_text or None,
+                formatting_entities=promo1_entities,
+            )
+            return "media"
+        except RPCError as media_exc:
+            logger.info("사진 전송 실패, 텍스트 전용 홍보로 전환: %s", media_exc)
+            if promo2:
+                await send_text_promo(entity, promo2)
+            elif promo1_text:
+                await client.send_message(
+                    entity,
+                    promo1_text,
+                    formatting_entities=promo1_entities,
+                    link_preview=True,
+                )
+            else:
+                raise media_exc
+            return "text-fallback"
+
+    if promo2:
+        return await send_text_promo(entity, promo2)
+
+    if promo1_text:
+        await client.send_message(
+            entity,
+            promo1_text,
+            formatting_entities=promo1_entities,
+            link_preview=True,
+        )
+        return "text"
+
+    raise ValueError("저장된 홍보 메시지에 보낼 내용이 없습니다.")
+
+
+async def send_to_entity(entity, promo1, promo2, text, image_exists):
+    if promo1:
+        return await send_dual_promo(entity, promo1, promo2)
 
     if image_exists:
         try:
             await client.send_file(entity, PROMO_IMAGE_FILE, caption=text)
             return "media"
         except RPCError as media_exc:
-            logger.info("미디어 전송 실패, 텍스트로 전환: %s", media_exc)
+            logger.info("사진 전송 실패, promo.txt 문구로 전환: %s", media_exc)
             await client.send_message(entity, text, link_preview=True)
             return "text-fallback"
 
     await client.send_message(entity, text, link_preview=True)
     return "text"
-
 
 def read_targets() -> List[str]:
     env_targets = os.getenv("TARGETS", "").strip()
@@ -311,20 +334,25 @@ async def send_promotions():
 
     try:
         targets = read_targets()
-        saved_promo = await get_saved_promo_message()
-        text = None if saved_promo else read_promo_text()
+        promo1 = await get_saved_promo_message(
+            PROMO1_MESSAGE_ID_FILE, "사진+텍스트 홍보"
+        )
+        promo2 = await get_saved_promo_message(
+            PROMO2_MESSAGE_ID_FILE, "텍스트 전용 홍보"
+        )
+        text = None if promo1 else read_promo_text()
     except Exception as exc:
         await control_message(f"❌ 설정 오류\n{exc}")
         return
 
-    image_exists = PROMO_IMAGE_FILE.exists() and saved_promo is None
+    image_exists = PROMO_IMAGE_FILE.exists() and promo1 is None
     total = len(targets)
     success = 0
     failed = 0
 
     await control_message(
         f"🚀 발송 시작\n대상: {total}개\n간격: {SEND_INTERVAL}초\n"
-        f"홍보 방식: {'저장 메시지' if saved_promo else ('이미지+문구' if image_exists else '문구')}"
+        f"홍보 방식: {'사진+텍스트 / 텍스트 자동 구분' if promo1 else ('이미지+문구' if image_exists else '문구')}"
     )
 
     for index, target in enumerate(targets, start=1):
@@ -338,7 +366,7 @@ async def send_promotions():
             key = int(target) if target.lstrip("-").isdigit() else target
             entity = await client.get_entity(key)
 
-            mode = await send_to_entity(entity, saved_promo, text, image_exists)
+            mode = await send_to_entity(entity, promo1, promo2, text, image_exists)
             success += 1
             if mode == "text-fallback":
                 logger.info("[%s/%s] 사진 제한으로 텍스트 발송: %s", index, total, target)
@@ -355,7 +383,7 @@ async def send_promotions():
                 key = int(target) if target.lstrip("-").isdigit() else target
                 entity = await client.get_entity(key)
 
-                mode = await send_to_entity(entity, saved_promo, text, image_exists)
+                mode = await send_to_entity(entity, promo1, promo2, text, image_exists)
                 success += 1
                 if mode == "text-fallback":
                     logger.info("재시도 시 사진 제한으로 텍스트 발송: %s", target)
@@ -413,19 +441,41 @@ async def control_handler(event):
 
     if waiting_for_promo:
         command_preview = event.raw_text.strip()
+
         if command_preview == "/cancel":
-            waiting_for_promo = False
+            waiting_for_promo = None
             await event.respond("❎ 홍보 메시지 저장을 취소했습니다.")
             return
+
         if command_preview.startswith("/") and not event.media:
-            await event.respond("⚠️ 지금은 홍보 메시지를 기다리고 있습니다. 취소하려면 /cancel을 입력하세요.")
+            await event.respond(
+                "⚠️ 지금은 홍보 메시지를 기다리고 있습니다. 취소하려면 /cancel을 입력하세요."
+            )
             return
-        PROMO_MESSAGE_ID_FILE.write_text(str(event.id), encoding="utf-8")
-        waiting_for_promo = False
+
+        if waiting_for_promo == "promo1":
+            PROMO1_MESSAGE_ID_FILE.write_text(str(event.id), encoding="utf-8")
+            saved_label = "사진+텍스트 홍보 메시지"
+        else:
+            if event.media:
+                await event.respond(
+                    "❌ /setpromo2에는 사진 없이 텍스트만 보내주세요.\n"
+                    "다시 텍스트 메시지를 보내거나 /cancel을 입력하세요."
+                )
+                return
+            if not event.raw_text.strip():
+                await event.respond(
+                    "❌ 텍스트 문구가 비어 있습니다. 다시 보내거나 /cancel을 입력하세요."
+                )
+                return
+            PROMO2_MESSAGE_ID_FILE.write_text(str(event.id), encoding="utf-8")
+            saved_label = "텍스트 전용 홍보 메시지"
+
+        waiting_for_promo = None
         await event.respond(
-            "✅ 홍보 메시지를 저장했습니다.\n"
-            "굵게, 링크, 프리미엄 커스텀 이모지와 첨부 미디어를 가능한 한 그대로 발송합니다.\n"
-            "테스트하려면 대상 1개로 /send를 입력하세요."
+            f"✅ {saved_label}를 저장했습니다.\n"
+            "이제 /send 한 번으로 사진 가능 그룹에는 사진+텍스트, "
+            "사진 제한 그룹에는 텍스트만 자동 발송합니다."
         )
         return
 
@@ -442,8 +492,9 @@ async def control_handler(event):
             "/stop - 진행 중인 발송 중지\n"
             "/status - 현재 상태 확인\n"
             "/files - 현재 파일 상태 확인\n"
-            "/setpromo - 다음 메시지를 홍보 원본으로 저장\n"
-            "/clearpromo - 저장한 홍보 원본 삭제\n"
+            "/setpromo1 - 사진+텍스트 홍보 저장\n"
+            "/setpromo2 - 텍스트 전용 홍보 저장\n"
+            "/clearpromo - 저장한 홍보 원본 2개 삭제\n"
             "/autoon - 자동 발송 켜기\n"
             "/autooff - 자동 발송 끄기\n"
             "/schedule 6h - 6시간마다 발송\n"
@@ -453,24 +504,38 @@ async def control_handler(event):
             "targets.txt - 발송 대상 교체\n"
             "promo.txt - 홍보 문구 교체\n"
             "promo.jpg - 홍보 이미지 교체\n\n"
-            "프리미엄 이모지/서식을 유지하려면 /setpromo 입력 후\n"
-            "홍보할 메시지를 저장한 메시지에 그대로 보내세요.\n"
-            "사진이 금지된 그룹은 같은 문구를 텍스트로 자동 전송합니다.\n"
+            "사용 순서\n"
+            "1. /setpromo1 입력 후 사진+텍스트 메시지 전송\n"
+            "2. /setpromo2 입력 후 텍스트 전용 메시지 전송\n"
+            "3. /send 또는 자동 일정으로 발송\n"
+            "사진 제한 그룹에는 텍스트 전용 홍보가 자동 전송됩니다.\n"
             f"현재 자동 일정: {schedule_description()}\n"
             "명령어와 파일은 텔레그램 '저장한 메시지'에 보내세요."
         )
 
-    elif command == "/setpromo":
-        waiting_for_promo = True
+    elif command in {"/setpromo", "/setpromo1"}:
+        waiting_for_promo = "promo1"
         await event.respond(
-            "📝 다음에 보내는 메시지를 홍보 원본으로 저장합니다.\n"
-            "텍스트, 사진, 동영상, 굵게, 링크, 프리미엄 커스텀 이모지를 포함해 작성하세요.\n"
+            "🖼 다음에 보내는 메시지를 사진+텍스트 홍보 원본으로 저장합니다.\n"
+            "사진, 텍스트, 굵게, 링크, 프리미엄 커스텀 이모지를 포함해 보내세요.\n"
+            "취소하려면 /cancel을 입력하세요."
+        )
+
+    elif command == "/setpromo2":
+        waiting_for_promo = "promo2"
+        await event.respond(
+            "📝 다음에 보내는 메시지를 텍스트 전용 홍보 원본으로 저장합니다.\n"
+            "사진 없이 텍스트, 굵게, 링크, 프리미엄 커스텀 이모지만 보내세요.\n"
             "취소하려면 /cancel을 입력하세요."
         )
 
     elif command == "/clearpromo":
-        PROMO_MESSAGE_ID_FILE.unlink(missing_ok=True)
-        await event.respond("✅ 저장한 홍보 원본을 삭제했습니다. 이제 promo.txt/promo.jpg를 사용합니다.")
+        PROMO1_MESSAGE_ID_FILE.unlink(missing_ok=True)
+        PROMO2_MESSAGE_ID_FILE.unlink(missing_ok=True)
+        await event.respond(
+            "✅ 사진+텍스트 및 텍스트 전용 홍보 원본을 모두 삭제했습니다. "
+            "이제 promo.txt/promo.jpg를 사용합니다."
+        )
 
     elif command == "/autoon":
         set_auto_send_enabled(True)
@@ -574,14 +639,16 @@ async def control_handler(event):
             promo_status = f"확인 필요 ({exc})"
 
         image_status = "있음" if PROMO_IMAGE_FILE.exists() else "없음"
-        saved_message_status = "있음" if read_promo_message_id() else "없음"
+        promo1_status = "있음" if read_message_id(PROMO1_MESSAGE_ID_FILE) else "없음"
+        promo2_status = "있음" if read_message_id(PROMO2_MESSAGE_ID_FILE) else "없음"
 
         await event.respond(
             "📁 현재 파일 상태\n"
             f"targets.txt: {targets_status}\n"
             f"promo.txt: {promo_status}\n"
             f"promo.jpg: {image_status}\n"
-            f"저장한 홍보 메시지: {saved_message_status}"
+            f"사진+텍스트 홍보: {promo1_status}\n"
+            f"텍스트 전용 홍보: {promo2_status}"
         )
 
 
