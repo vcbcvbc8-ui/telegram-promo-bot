@@ -60,6 +60,68 @@ async def control_message(text: str):
     await client.send_message("me", text)
 
 
+def count_targets_file(path: Path) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        value = raw.strip()
+        if value and not value.startswith("#"):
+            count += 1
+    return count
+
+
+def file_status_text() -> str:
+    target_count = count_targets_file(TARGETS_FILE)
+    promo_text_status = "있음" if PROMO_TEXT_FILE.exists() and PROMO_TEXT_FILE.stat().st_size > 0 else "없음"
+    promo_image_status = "있음" if PROMO_IMAGE_FILE.exists() and PROMO_IMAGE_FILE.stat().st_size > 0 else "없음"
+    return (
+        "현재 설정\n\n"
+        f"targets.txt : {target_count}개\n"
+        f"promo.txt : {promo_text_status}\n"
+        f"promo.jpg : {promo_image_status}"
+    )
+
+
+async def save_uploaded_file(event, filename: str, destination: Path):
+    temp_path = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        await event.message.download_media(file=str(temp_path))
+
+        if filename in {"targets.txt", "promo.txt"}:
+            content = temp_path.read_text(encoding="utf-8-sig")
+            if filename == "targets.txt":
+                valid_targets = [
+                    line.strip()
+                    for line in content.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+                if not valid_targets:
+                    raise ValueError("targets.txt에 발송 대상이 없습니다.")
+            else:
+                if not content.strip():
+                    raise ValueError("promo.txt가 비어 있습니다.")
+            temp_path.write_text(content, encoding="utf-8")
+
+        if filename == "promo.jpg" and temp_path.stat().st_size == 0:
+            raise ValueError("promo.jpg 파일이 비어 있습니다.")
+
+        temp_path.replace(destination)
+
+        if filename == "targets.txt":
+            await event.respond(
+                f"✅ targets.txt 업데이트 완료\n총 {count_targets_file(TARGETS_FILE)}개 대상 저장"
+            )
+        elif filename == "promo.txt":
+            await event.respond("✅ promo.txt 업데이트 완료")
+        else:
+            await event.respond("✅ promo.jpg 업데이트 완료")
+    except Exception as exc:
+        if temp_path.exists():
+            temp_path.unlink()
+        await event.respond(f"❌ {filename} 업데이트 실패\n{exc}")
+
+
 async def scan_groups() -> Path:
     lines = [
         "# 홍보 게시가 허용된 그룹만 targets.txt에 복사하세요.",
@@ -159,7 +221,9 @@ async def control_handler(event):
             "/send - 전체 발송 시작\n"
             "/stop - 진행 중인 발송 중지\n"
             "/status - 현재 상태 확인\n"
+            "/files - 현재 파일 설정 확인\n"
             "/help - 도움말\n\n"
+            "파일 업데이트: 저장한 메시지에 targets.txt, promo.txt 또는 promo.jpg를 보내세요.\n"
             "명령어는 텔레그램 '저장한 메시지'에 입력하세요."
         )
     elif command == "/scan":
@@ -185,6 +249,27 @@ async def control_handler(event):
         await event.respond(
             f"상태: {'발송 중' if running else '대기 중'}\n발송 간격: {SEND_INTERVAL}초"
         )
+    elif command == "/files":
+        await event.respond(file_status_text())
+
+
+@client.on(events.NewMessage(chats="me", outgoing=True))
+async def file_upload_handler(event):
+    if not event.message.file:
+        return
+
+    filename = (event.message.file.name or "").strip()
+    allowed_files = {
+        "targets.txt": TARGETS_FILE,
+        "promo.txt": PROMO_TEXT_FILE,
+        "promo.jpg": PROMO_IMAGE_FILE,
+    }
+
+    destination = allowed_files.get(filename)
+    if destination is None:
+        return
+
+    await save_uploaded_file(event, filename, destination)
 
 
 async def main():
