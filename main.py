@@ -21,6 +21,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"].strip()
 STRING_SESSION = os.environ["STRING_SESSION"].strip()
 SEND_INTERVAL = max(10, int(os.getenv("SEND_INTERVAL", "10")))
+SEND_TIMEOUT = max(30, int(os.getenv("SEND_TIMEOUT", "60")))
 PROMO_TEXT_FILE = Path(os.getenv("PROMO_TEXT_FILE", "promo.txt"))
 PROMO_IMAGE_FILE = Path(os.getenv("PROMO_IMAGE_FILE", "promo.jpg"))
 TARGETS_FILE = Path(os.getenv("TARGETS_FILE", "targets.txt"))
@@ -405,9 +406,12 @@ async def send_promotions(targets_override=None, run_label="발송"):
 
         try:
             key = int(target) if target.lstrip("-").isdigit() else target
-            entity = await client.get_entity(key)
+            entity = await asyncio.wait_for(client.get_entity(key), timeout=SEND_TIMEOUT)
 
-            mode = await send_to_entity(entity, promo1, promo2, text_value, image_exists)
+            mode = await asyncio.wait_for(
+                send_to_entity(entity, promo1, promo2, text_value, image_exists),
+                timeout=SEND_TIMEOUT,
+            )
             progress_success += 1
             logger.info("[%s/%s] 성공: %s (%s)", index, total, target, mode)
 
@@ -420,14 +424,28 @@ async def send_promotions(targets_override=None, run_label="발송"):
 
             try:
                 key = int(target) if target.lstrip("-").isdigit() else target
-                entity = await client.get_entity(key)
-                mode = await send_to_entity(entity, promo1, promo2, text_value, image_exists)
+                entity = await asyncio.wait_for(client.get_entity(key), timeout=SEND_TIMEOUT)
+                mode = await asyncio.wait_for(
+                    send_to_entity(entity, promo1, promo2, text_value, image_exists),
+                    timeout=SEND_TIMEOUT,
+                )
                 progress_success += 1
                 logger.info("[%s/%s] 재시도 성공: %s (%s)", index, total, target, mode)
             except Exception as retry_exc:
                 progress_failed += 1
                 failed_targets.append(target)
                 logger.exception("재시도 실패 %s: %s", target, retry_exc)
+
+        except asyncio.TimeoutError:
+            progress_failed += 1
+            failed_targets.append(target)
+            logger.warning(
+                "[%s/%s] 시간 초과 %s: %s초 안에 응답 없음",
+                index,
+                total,
+                target,
+                SEND_TIMEOUT,
+            )
 
         except (RPCError, ValueError, TypeError) as exc:
             progress_failed += 1
@@ -785,9 +803,8 @@ async def handle_control_message(event):
         )
 
 
-@client.on(events.NewMessage(chats="me"))
+@client.on(events.NewMessage(chats="me", outgoing=True))
 async def control_handler(event):
-    """저장된 메시지 명령 처리. 오류가 나도 핸들러가 조용히 멈추지 않도록 보호합니다."""
     try:
         await handle_control_message(event)
     except Exception as exc:
