@@ -352,6 +352,22 @@ def save_failed_targets(targets: list[str]) -> None:
     )
 
 
+def read_failed_targets() -> list[str]:
+    if not FAILED_TARGETS_FILE.exists():
+        raise FileNotFoundError("failed_targets.txt가 없습니다.")
+
+    targets = []
+    for raw in FAILED_TARGETS_FILE.read_text(encoding="utf-8").splitlines():
+        value = raw.strip()
+        if value and not value.startswith("#"):
+            targets.append(value)
+
+    if not targets:
+        raise ValueError("다시 보낼 실패 그룹이 없습니다.")
+
+    return targets
+
+
 async def send_progress_message(current: int, total: int, success: int, failed: int) -> None:
     remaining = max(0, total - current)
     percent = int((current / total) * 100) if total else 100
@@ -364,7 +380,7 @@ async def send_progress_message(current: int, total: int, success: int, failed: 
     )
 
 
-async def send_promotions():
+async def send_promotions(targets_override=None, run_label="발송"):
     global stop_requested
     global progress_current, progress_total, progress_success, progress_failed
     global progress_started_at
@@ -377,7 +393,7 @@ async def send_promotions():
     progress_started_at = datetime.now(KST)
 
     try:
-        targets = read_targets()
+        targets = list(targets_override) if targets_override is not None else read_targets()
         promo1 = await get_saved_promo_message(
             PROMO1_MESSAGE_ID_FILE, "사진+텍스트 홍보"
         )
@@ -395,7 +411,7 @@ async def send_promotions():
     failed_targets = []
 
     await control_message(
-        f"🚀 발송 시작\n대상: {total}개\n간격: {SEND_INTERVAL}초\n"
+        f"🚀 {run_label} 시작\n대상: {total}개\n간격: {SEND_INTERVAL}초\n"
         f"홍보 방식: {'사진+텍스트 / 텍스트 자동 구분' if promo1 else ('이미지+문구' if image_exists else '문구')}"
     )
 
@@ -403,7 +419,7 @@ async def send_promotions():
         if stop_requested:
             save_failed_targets(failed_targets)
             await control_message(
-                f"⛔ 발송 중지\n"
+                f"⛔ {run_label} 중지\n"
                 f"진행: {progress_current}/{total}\n"
                 f"성공: {progress_success}개\n"
                 f"실패: {progress_failed}개"
@@ -479,7 +495,7 @@ async def send_promotions():
     elapsed_seconds = int(elapsed.total_seconds() % 60)
 
     await control_message(
-        f"✅ 발송 완료\n"
+        f"✅ {run_label} 완료\n"
         f"성공: {progress_success}개\n"
         f"실패: {progress_failed}개\n"
         f"전체: {total}개\n"
@@ -490,7 +506,7 @@ async def send_promotions():
         await client.send_file(
             "me",
             FAILED_TARGETS_FILE,
-            caption=f"실패한 그룹 {len(failed_targets)}개 목록입니다.",
+            caption=f"{run_label} 후에도 실패한 그룹 {len(failed_targets)}개 목록입니다.",
         )
 
 
@@ -577,6 +593,7 @@ async def control_handler(event):
             "명령어\n"
             "/scan - 가입한 그룹 목록 만들기\n"
             "/send - 전체 발송 시작\n"
+            "/retry - 실패한 그룹만 다시 발송\n"
             "/stop - 진행 중인 발송 중지\n"
             "/status - 현재 상태 확인\n"
             "/progress - 현재 발송 진행률 확인\n"
@@ -697,6 +714,28 @@ async def control_handler(event):
             return
         send_task = asyncio.create_task(send_promotions())
 
+    elif command in {"/retry", "/retry_failed"}:
+        if send_task and not send_task.done():
+            await event.respond("⚠️ 이미 발송 중입니다.")
+            return
+
+        try:
+            retry_targets = read_failed_targets()
+        except Exception as exc:
+            await event.respond(f"❌ 재발송할 수 없습니다.\n{exc}")
+            return
+
+        await event.respond(
+            f"🔄 실패 그룹 재발송을 준비합니다.\n"
+            f"대상: {len(retry_targets)}개"
+        )
+        send_task = asyncio.create_task(
+            send_promotions(
+                targets_override=retry_targets,
+                run_label="실패 그룹 재발송",
+            )
+        )
+
     elif command == "/stop":
         stop_requested = True
         await event.respond("⏹ 중지 요청을 받았습니다. 현재 작업 후 멈춥니다.")
@@ -780,13 +819,20 @@ async def control_handler(event):
         promo1_status = "있음" if read_message_id(PROMO1_MESSAGE_ID_FILE) else "없음"
         promo2_status = "있음" if read_message_id(PROMO2_MESSAGE_ID_FILE) else "없음"
 
+        try:
+            failed_count = len(read_failed_targets())
+            failed_status = f"있음 ({failed_count}개)"
+        except Exception:
+            failed_status = "없음"
+
         await event.respond(
             "📁 현재 파일 상태\n"
             f"targets.txt: {targets_status}\n"
             f"promo.txt: {promo_status}\n"
             f"promo.jpg: {image_status}\n"
             f"사진+텍스트 홍보: {promo1_status}\n"
-            f"텍스트 전용 홍보: {promo2_status}"
+            f"텍스트 전용 홍보: {promo2_status}\n"
+            f"실패 그룹 목록: {failed_status}"
         )
 
 
