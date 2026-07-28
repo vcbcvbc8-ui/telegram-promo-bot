@@ -579,6 +579,7 @@ async def control_handler(event):
             "/send - 전체 발송 시작\n"
             "/stop - 진행 중인 발송 중지\n"
             "/status - 현재 상태 확인\n"
+            "/progress - 현재 발송 진행률 확인\n"
             "/files - 현재 파일 상태 확인\n"
             "/setpromo1 - 사진+텍스트 홍보 저장\n"
             "/setpromo2 - 텍스트 전용 홍보 저장\n"
@@ -722,6 +723,44 @@ async def control_handler(event):
             f"{progress_line}"
             f"그룹 간 발송 간격: {SEND_INTERVAL}초\n"
             f"자동 발송: {auto_line}"
+        )
+
+    elif command == "/progress":
+        running = bool(send_task and not send_task.done())
+
+        if not running or not progress_total:
+            await event.respond(
+                "현재 진행 중인 발송이 없습니다.\n"
+                f"마지막 상태: 성공 {progress_success}개 / 실패 {progress_failed}개"
+            )
+            return
+
+        remaining = max(0, progress_total - progress_current)
+        percent = int((progress_current / progress_total) * 100) if progress_total else 0
+
+        elapsed_seconds = 0
+        if progress_started_at:
+            elapsed_seconds = max(
+                0,
+                int((datetime.now(KST) - progress_started_at).total_seconds()),
+            )
+
+        if progress_current > 0:
+            average_seconds = elapsed_seconds / progress_current
+            estimated_seconds = int(average_seconds * remaining)
+        else:
+            estimated_seconds = remaining * SEND_INTERVAL
+
+        estimated_minutes = estimated_seconds // 60
+        estimated_remainder = estimated_seconds % 60
+
+        await event.respond(
+            "📊 현재 발송 진행률\n"
+            f"진행: {progress_current}/{progress_total} ({percent}%)\n"
+            f"성공: {progress_success}개\n"
+            f"실패: {progress_failed}개\n"
+            f"남음: {remaining}개\n"
+            f"예상 남은 시간: 약 {estimated_minutes}분 {estimated_remainder}초"
         )
 
     elif command == "/files":
