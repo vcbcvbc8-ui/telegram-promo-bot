@@ -29,7 +29,6 @@ PROMO2_MESSAGE_ID_FILE = Path(os.getenv("PROMO2_MESSAGE_ID_FILE", "promo2_messag
 AUTO_SEND_ENABLED_FILE = Path(os.getenv("AUTO_SEND_ENABLED_FILE", "auto_send_enabled.txt"))
 SCHEDULE_FILE = Path(os.getenv("SCHEDULE_FILE", "schedule.txt"))
 FAILED_TARGETS_FILE = Path(os.getenv("FAILED_TARGETS_FILE", "failed_targets.txt"))
-SEND_LOG_FILE = Path(os.getenv("SEND_LOG_FILE", "send_log.txt"))
 KST = ZoneInfo("Asia/Seoul")
 AUTO_SEND_DEFAULT = os.getenv("AUTO_SEND_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_SCHEDULE = os.getenv("AUTO_SEND_SCHEDULE", "times:00:00,06:00,12:00,18:00").strip()
@@ -335,16 +334,6 @@ async def scan_groups() -> Path:
     return output
 
 
-def append_send_log(target: str, result: str, detail: str = "") -> None:
-    timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
-    clean_detail = detail.replace("\n", " ").strip()
-    line = f"{timestamp}\t{target}\t{result}"
-    if clean_detail:
-        line += f"\t{clean_detail}"
-    with SEND_LOG_FILE.open("a", encoding="utf-8") as file:
-        file.write(line + "\n")
-
-
 def save_failed_targets(targets: list[str]) -> None:
     FAILED_TARGETS_FILE.write_text(
         "\n".join(targets) + ("\n" if targets else ""),
@@ -366,18 +355,6 @@ def read_failed_targets() -> list[str]:
         raise ValueError("다시 보낼 실패 그룹이 없습니다.")
 
     return targets
-
-
-async def send_progress_message(current: int, total: int, success: int, failed: int) -> None:
-    remaining = max(0, total - current)
-    percent = int((current / total) * 100) if total else 100
-    await control_message(
-        f"📤 발송 진행률\n"
-        f"{current} / {total} ({percent}%)\n"
-        f"성공: {success}개\n"
-        f"실패: {failed}개\n"
-        f"남음: {remaining}개"
-    )
 
 
 async def send_promotions(targets_override=None, run_label="발송"):
@@ -426,18 +403,12 @@ async def send_promotions(targets_override=None, run_label="발송"):
             )
             return
 
-        result = "실패"
-        detail = ""
-
         try:
             key = int(target) if target.lstrip("-").isdigit() else target
             entity = await client.get_entity(key)
-            mode = await send_to_entity(
-                entity, promo1, promo2, text_value, image_exists
-            )
+
+            mode = await send_to_entity(entity, promo1, promo2, text_value, image_exists)
             progress_success += 1
-            result = "성공"
-            detail = mode
             logger.info("[%s/%s] 성공: %s (%s)", index, total, target, mode)
 
         except FloodWaitError as exc:
@@ -450,42 +421,26 @@ async def send_promotions(targets_override=None, run_label="발송"):
             try:
                 key = int(target) if target.lstrip("-").isdigit() else target
                 entity = await client.get_entity(key)
-                mode = await send_to_entity(
-                    entity, promo1, promo2, text_value, image_exists
-                )
+                mode = await send_to_entity(entity, promo1, promo2, text_value, image_exists)
                 progress_success += 1
-                result = "성공"
-                detail = f"재시도 성공/{mode}"
+                logger.info("[%s/%s] 재시도 성공: %s (%s)", index, total, target, mode)
             except Exception as retry_exc:
                 progress_failed += 1
                 failed_targets.append(target)
-                detail = f"재시도 실패: {retry_exc}"
                 logger.exception("재시도 실패 %s: %s", target, retry_exc)
 
         except (RPCError, ValueError, TypeError) as exc:
             progress_failed += 1
             failed_targets.append(target)
-            detail = str(exc)
             logger.warning("[%s/%s] 실패 %s: %s", index, total, target, exc)
 
         except Exception as exc:
             progress_failed += 1
             failed_targets.append(target)
-            detail = str(exc)
             logger.exception("[%s/%s] 예외 %s: %s", index, total, target, exc)
 
         progress_current = index
-        append_send_log(target, result, detail)
         save_failed_targets(failed_targets)
-
-        # 10개마다, 마지막 대상에서 진행률을 저장된 메시지로 알립니다.
-        if index % 10 == 0 or index == total:
-            await send_progress_message(
-                progress_current,
-                progress_total,
-                progress_success,
-                progress_failed,
-            )
 
         if index < total and not stop_requested:
             await asyncio.sleep(SEND_INTERVAL)
@@ -725,15 +680,9 @@ async def control_handler(event):
             await event.respond(f"❌ 재발송할 수 없습니다.\n{exc}")
             return
 
-        await event.respond(
-            f"🔄 실패 그룹 재발송을 준비합니다.\n"
-            f"대상: {len(retry_targets)}개"
-        )
+        await event.respond(f"🔄 실패 그룹 재발송 준비\n대상: {len(retry_targets)}개")
         send_task = asyncio.create_task(
-            send_promotions(
-                targets_override=retry_targets,
-                run_label="실패 그룹 재발송",
-            )
+            send_promotions(retry_targets, "실패 그룹 재발송")
         )
 
     elif command == "/stop":
@@ -790,16 +739,13 @@ async def control_handler(event):
         else:
             estimated_seconds = remaining * SEND_INTERVAL
 
-        estimated_minutes = estimated_seconds // 60
-        estimated_remainder = estimated_seconds % 60
-
         await event.respond(
             "📊 현재 발송 진행률\n"
             f"진행: {progress_current}/{progress_total} ({percent}%)\n"
             f"성공: {progress_success}개\n"
             f"실패: {progress_failed}개\n"
             f"남음: {remaining}개\n"
-            f"예상 남은 시간: 약 {estimated_minutes}분 {estimated_remainder}초"
+            f"예상 남은 시간: 약 {estimated_seconds // 60}분 {estimated_seconds % 60}초"
         )
 
     elif command == "/files":
@@ -818,10 +764,8 @@ async def control_handler(event):
         image_status = "있음" if PROMO_IMAGE_FILE.exists() else "없음"
         promo1_status = "있음" if read_message_id(PROMO1_MESSAGE_ID_FILE) else "없음"
         promo2_status = "있음" if read_message_id(PROMO2_MESSAGE_ID_FILE) else "없음"
-
         try:
-            failed_count = len(read_failed_targets())
-            failed_status = f"있음 ({failed_count}개)"
+            failed_status = f"있음 ({len(read_failed_targets())}개)"
         except Exception:
             failed_status = "없음"
 
