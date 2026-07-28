@@ -22,6 +22,7 @@ API_HASH = os.environ["API_HASH"].strip()
 STRING_SESSION = os.environ["STRING_SESSION"].strip()
 SEND_INTERVAL = max(10, int(os.getenv("SEND_INTERVAL", "10")))
 SEND_TIMEOUT = max(30, int(os.getenv("SEND_TIMEOUT", "60")))
+MAX_FLOOD_WAIT = max(0, int(os.getenv("MAX_FLOOD_WAIT", "30")))
 PROMO_TEXT_FILE = Path(os.getenv("PROMO_TEXT_FILE", "promo.txt"))
 PROMO_IMAGE_FILE = Path(os.getenv("PROMO_IMAGE_FILE", "promo.jpg"))
 TARGETS_FILE = Path(os.getenv("TARGETS_FILE", "targets.txt"))
@@ -34,7 +35,12 @@ KST = ZoneInfo("Asia/Seoul")
 AUTO_SEND_DEFAULT = os.getenv("AUTO_SEND_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_SCHEDULE = os.getenv("AUTO_SEND_SCHEDULE", "times:00:00,06:00,12:00,18:00").strip()
 
-client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+client = TelegramClient(
+    StringSession(STRING_SESSION),
+    API_ID,
+    API_HASH,
+    flood_sleep_threshold=MAX_FLOOD_WAIT,
+)
 send_task = None
 stop_requested = False
 waiting_for_promo = None
@@ -182,6 +188,23 @@ async def send_dual_promo(entity, promo1, promo2):
                 formatting_entities=promo1_entities,
             )
             return "media"
+        except FloodWaitError as media_exc:
+            logger.warning(
+                "사진 FloodWait %s초, 텍스트 전용 홍보로 즉시 전환",
+                int(media_exc.seconds),
+            )
+            if promo2:
+                await send_text_promo(entity, promo2)
+            elif promo1_text:
+                await client.send_message(
+                    entity,
+                    promo1_text,
+                    formatting_entities=promo1_entities,
+                    link_preview=True,
+                )
+            else:
+                raise media_exc
+            return "text-fallback"
         except RPCError as media_exc:
             logger.info("사진 전송 실패, 텍스트 전용 홍보로 전환: %s", media_exc)
             if promo2:
@@ -220,6 +243,13 @@ async def send_to_entity(entity, promo1, promo2, text, image_exists):
         try:
             await client.send_file(entity, PROMO_IMAGE_FILE, caption=text)
             return "media"
+        except FloodWaitError as media_exc:
+            logger.warning(
+                "사진 FloodWait %s초, promo.txt 텍스트로 즉시 전환",
+                int(media_exc.seconds),
+            )
+            await client.send_message(entity, text, link_preview=True)
+            return "text-fallback"
         except RPCError as media_exc:
             logger.info("사진 전송 실패, promo.txt 문구로 전환: %s", media_exc)
             await client.send_message(entity, text, link_preview=True)
@@ -416,25 +446,56 @@ async def send_promotions(targets_override=None, run_label="발송"):
             logger.info("[%s/%s] 성공: %s (%s)", index, total, target, mode)
 
         except FloodWaitError as exc:
-            wait_seconds = int(exc.seconds) + 5
-            await control_message(
-                f"⏳ Telegram 제한으로 {wait_seconds}초 대기합니다.\n대상: {target}"
-            )
-            await asyncio.sleep(wait_seconds)
+            wait_seconds = int(exc.seconds)
 
-            try:
-                key = int(target) if target.lstrip("-").isdigit() else target
-                entity = await asyncio.wait_for(client.get_entity(key), timeout=SEND_TIMEOUT)
-                mode = await asyncio.wait_for(
-                    send_to_entity(entity, promo1, promo2, text_value, image_exists),
-                    timeout=SEND_TIMEOUT,
+            if wait_seconds <= MAX_FLOOD_WAIT:
+                logger.warning(
+                    "[%s/%s] 짧은 FloodWait %s초: %s",
+                    index,
+                    total,
+                    wait_seconds,
+                    target,
                 )
-                progress_success += 1
-                logger.info("[%s/%s] 재시도 성공: %s (%s)", index, total, target, mode)
-            except Exception as retry_exc:
+                await asyncio.sleep(wait_seconds + 1)
+
+                try:
+                    key = int(target) if target.lstrip("-").isdigit() else target
+                    entity = await asyncio.wait_for(
+                        client.get_entity(key),
+                        timeout=SEND_TIMEOUT,
+                    )
+                    mode = await asyncio.wait_for(
+                        send_to_entity(
+                            entity,
+                            promo1,
+                            promo2,
+                            text_value,
+                            image_exists,
+                        ),
+                        timeout=SEND_TIMEOUT,
+                    )
+                    progress_success += 1
+                    logger.info(
+                        "[%s/%s] 재시도 성공: %s (%s)",
+                        index,
+                        total,
+                        target,
+                        mode,
+                    )
+                except Exception as retry_exc:
+                    progress_failed += 1
+                    failed_targets.append(target)
+                    logger.exception("재시도 실패 %s: %s", target, retry_exc)
+            else:
                 progress_failed += 1
                 failed_targets.append(target)
-                logger.exception("재시도 실패 %s: %s", target, retry_exc)
+                logger.warning(
+                    "[%s/%s] 긴 FloodWait %s초로 건너뜀: %s",
+                    index,
+                    total,
+                    wait_seconds,
+                    target,
+                )
 
         except asyncio.TimeoutError:
             progress_failed += 1
@@ -593,6 +654,7 @@ async def handle_control_message(event):
             "2. /setpromo2 입력 후 텍스트 전용 메시지 전송\n"
             "3. /send 또는 자동 일정으로 발송\n"
             "사진 제한 그룹에는 텍스트 전용 홍보가 자동 전송됩니다.\n"
+            "긴 Telegram 대기 제한이 발생하면 해당 그룹만 실패 처리하고 다음 그룹으로 진행합니다.\n"
             f"현재 자동 일정: {schedule_description()}\n"
             "명령어와 파일은 텔레그램 '저장한 메시지'에 보내세요."
         )
@@ -733,6 +795,8 @@ async def handle_control_message(event):
             f"상태: {'발송 중' if running else '대기 중'}\n"
             f"{progress_line}"
             f"그룹 간 발송 간격: {SEND_INTERVAL}초\n"
+            f"그룹별 제한 시간: {SEND_TIMEOUT}초\n"
+            f"최대 FloodWait 대기: {MAX_FLOOD_WAIT}초\n"
             f"자동 발송: {auto_line}"
         )
 
