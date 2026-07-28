@@ -28,6 +28,8 @@ PROMO1_MESSAGE_ID_FILE = Path(os.getenv("PROMO1_MESSAGE_ID_FILE", "promo1_messag
 PROMO2_MESSAGE_ID_FILE = Path(os.getenv("PROMO2_MESSAGE_ID_FILE", "promo2_message_id.txt"))
 AUTO_SEND_ENABLED_FILE = Path(os.getenv("AUTO_SEND_ENABLED_FILE", "auto_send_enabled.txt"))
 SCHEDULE_FILE = Path(os.getenv("SCHEDULE_FILE", "schedule.txt"))
+FAILED_TARGETS_FILE = Path(os.getenv("FAILED_TARGETS_FILE", "failed_targets.txt"))
+SEND_LOG_FILE = Path(os.getenv("SEND_LOG_FILE", "send_log.txt"))
 KST = ZoneInfo("Asia/Seoul")
 AUTO_SEND_DEFAULT = os.getenv("AUTO_SEND_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_SCHEDULE = os.getenv("AUTO_SEND_SCHEDULE", "times:00:00,06:00,12:00,18:00").strip()
@@ -37,6 +39,11 @@ send_task = None
 stop_requested = False
 waiting_for_promo = None
 scheduler_task = None
+progress_current = 0
+progress_total = 0
+progress_success = 0
+progress_failed = 0
+progress_started_at = None
 
 
 def read_promo_text() -> str:
@@ -328,9 +335,46 @@ async def scan_groups() -> Path:
     return output
 
 
+def append_send_log(target: str, result: str, detail: str = "") -> None:
+    timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    clean_detail = detail.replace("\n", " ").strip()
+    line = f"{timestamp}\t{target}\t{result}"
+    if clean_detail:
+        line += f"\t{clean_detail}"
+    with SEND_LOG_FILE.open("a", encoding="utf-8") as file:
+        file.write(line + "\n")
+
+
+def save_failed_targets(targets: list[str]) -> None:
+    FAILED_TARGETS_FILE.write_text(
+        "\n".join(targets) + ("\n" if targets else ""),
+        encoding="utf-8",
+    )
+
+
+async def send_progress_message(current: int, total: int, success: int, failed: int) -> None:
+    remaining = max(0, total - current)
+    percent = int((current / total) * 100) if total else 100
+    await control_message(
+        f"📤 발송 진행률\n"
+        f"{current} / {total} ({percent}%)\n"
+        f"성공: {success}개\n"
+        f"실패: {failed}개\n"
+        f"남음: {remaining}개"
+    )
+
+
 async def send_promotions():
     global stop_requested
+    global progress_current, progress_total, progress_success, progress_failed
+    global progress_started_at
+
     stop_requested = False
+    progress_current = 0
+    progress_total = 0
+    progress_success = 0
+    progress_failed = 0
+    progress_started_at = datetime.now(KST)
 
     try:
         targets = read_targets()
@@ -340,15 +384,15 @@ async def send_promotions():
         promo2 = await get_saved_promo_message(
             PROMO2_MESSAGE_ID_FILE, "텍스트 전용 홍보"
         )
-        text = None if promo1 else read_promo_text()
+        text_value = None if promo1 else read_promo_text()
     except Exception as exc:
         await control_message(f"❌ 설정 오류\n{exc}")
         return
 
     image_exists = PROMO_IMAGE_FILE.exists() and promo1 is None
     total = len(targets)
-    success = 0
-    failed = 0
+    progress_total = total
+    failed_targets = []
 
     await control_message(
         f"🚀 발송 시작\n대상: {total}개\n간격: {SEND_INTERVAL}초\n"
@@ -357,20 +401,28 @@ async def send_promotions():
 
     for index, target in enumerate(targets, start=1):
         if stop_requested:
+            save_failed_targets(failed_targets)
             await control_message(
-                f"⛔ 발송 중지\n성공 {success}개 / 실패 {failed}개 / 전체 {total}개"
+                f"⛔ 발송 중지\n"
+                f"진행: {progress_current}/{total}\n"
+                f"성공: {progress_success}개\n"
+                f"실패: {progress_failed}개"
             )
             return
+
+        result = "실패"
+        detail = ""
 
         try:
             key = int(target) if target.lstrip("-").isdigit() else target
             entity = await client.get_entity(key)
-
-            mode = await send_to_entity(entity, promo1, promo2, text, image_exists)
-            success += 1
-            if mode == "text-fallback":
-                logger.info("[%s/%s] 사진 제한으로 텍스트 발송: %s", index, total, target)
-            logger.info("[%s/%s] 성공: %s", index, total, target)
+            mode = await send_to_entity(
+                entity, promo1, promo2, text_value, image_exists
+            )
+            progress_success += 1
+            result = "성공"
+            detail = mode
+            logger.info("[%s/%s] 성공: %s (%s)", index, total, target, mode)
 
         except FloodWaitError as exc:
             wait_seconds = int(exc.seconds) + 5
@@ -382,28 +434,64 @@ async def send_promotions():
             try:
                 key = int(target) if target.lstrip("-").isdigit() else target
                 entity = await client.get_entity(key)
-
-                mode = await send_to_entity(entity, promo1, promo2, text, image_exists)
-                success += 1
-                if mode == "text-fallback":
-                    logger.info("재시도 시 사진 제한으로 텍스트 발송: %s", target)
+                mode = await send_to_entity(
+                    entity, promo1, promo2, text_value, image_exists
+                )
+                progress_success += 1
+                result = "성공"
+                detail = f"재시도 성공/{mode}"
             except Exception as retry_exc:
-                failed += 1
+                progress_failed += 1
+                failed_targets.append(target)
+                detail = f"재시도 실패: {retry_exc}"
                 logger.exception("재시도 실패 %s: %s", target, retry_exc)
 
         except (RPCError, ValueError, TypeError) as exc:
-            failed += 1
+            progress_failed += 1
+            failed_targets.append(target)
+            detail = str(exc)
             logger.warning("[%s/%s] 실패 %s: %s", index, total, target, exc)
+
         except Exception as exc:
-            failed += 1
+            progress_failed += 1
+            failed_targets.append(target)
+            detail = str(exc)
             logger.exception("[%s/%s] 예외 %s: %s", index, total, target, exc)
+
+        progress_current = index
+        append_send_log(target, result, detail)
+        save_failed_targets(failed_targets)
+
+        # 10개마다, 마지막 대상에서 진행률을 저장된 메시지로 알립니다.
+        if index % 10 == 0 or index == total:
+            await send_progress_message(
+                progress_current,
+                progress_total,
+                progress_success,
+                progress_failed,
+            )
 
         if index < total and not stop_requested:
             await asyncio.sleep(SEND_INTERVAL)
 
+    elapsed = datetime.now(KST) - progress_started_at
+    elapsed_minutes = int(elapsed.total_seconds() // 60)
+    elapsed_seconds = int(elapsed.total_seconds() % 60)
+
     await control_message(
-        f"✅ 발송 완료\n성공: {success}개\n실패: {failed}개\n전체: {total}개"
+        f"✅ 발송 완료\n"
+        f"성공: {progress_success}개\n"
+        f"실패: {progress_failed}개\n"
+        f"전체: {total}개\n"
+        f"소요 시간: {elapsed_minutes}분 {elapsed_seconds}초"
     )
+
+    if failed_targets:
+        await client.send_file(
+            "me",
+            FAILED_TARGETS_FILE,
+            caption=f"실패한 그룹 {len(failed_targets)}개 목록입니다.",
+        )
 
 
 async def automatic_scheduler():
@@ -619,8 +707,19 @@ async def control_handler(event):
             f"켜짐 / {schedule_description()} / 다음: {next_auto_run().strftime('%Y-%m-%d %H:%M KST')}"
             if auto_enabled else "꺼짐"
         )
+        if running and progress_total:
+            remaining = max(0, progress_total - progress_current)
+            progress_line = (
+                f"진행률: {progress_current}/{progress_total}\n"
+                f"성공: {progress_success}개 / 실패: {progress_failed}개\n"
+                f"남음: {remaining}개\n"
+            )
+        else:
+            progress_line = ""
+
         await event.respond(
             f"상태: {'발송 중' if running else '대기 중'}\n"
+            f"{progress_line}"
             f"그룹 간 발송 간격: {SEND_INTERVAL}초\n"
             f"자동 발송: {auto_line}"
         )
