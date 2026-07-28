@@ -494,8 +494,7 @@ async def automatic_scheduler():
 
 
 
-@client.on(events.NewMessage(chats="me", outgoing=True))
-async def control_handler(event):
+async def handle_control_message(event):
     global send_task, stop_requested, waiting_for_promo
 
     if waiting_for_promo:
@@ -542,8 +541,13 @@ async def control_handler(event):
         return
 
     command = event.raw_text.strip()
+    if command.startswith("/"):
+        logger.info("명령 수신: %s", command)
 
-    if command == "/help":
+    if command == "/ping":
+        await event.respond("✅ 프로그램이 정상 작동 중입니다.")
+
+    elif command == "/help":
         await event.respond(
             "명령어\n"
             "/scan - 가입한 그룹 목록 만들기\n"
@@ -560,6 +564,7 @@ async def control_handler(event):
             "/autooff - 자동 발송 끄기\n"
             "/schedule 6h - 6시간마다 발송\n"
             "/schedule 08:00 14:00 20:00 - 지정 시간 발송\n"
+            "/ping - 프로그램 응답 확인\n"
             "/help - 도움말\n\n"
             "파일 업데이트\n"
             "targets.txt - 발송 대상 교체\n"
@@ -778,6 +783,24 @@ async def control_handler(event):
             f"텍스트 전용 홍보: {promo2_status}\n"
             f"실패 그룹 목록: {failed_status}"
         )
+
+
+@client.on(events.NewMessage(chats="me"))
+async def control_handler(event):
+    """저장된 메시지 명령 처리. 오류가 나도 핸들러가 조용히 멈추지 않도록 보호합니다."""
+    try:
+        await handle_control_message(event)
+    except Exception as exc:
+        logger.exception("명령 처리 오류: %s", exc)
+        try:
+            await event.respond(
+                "❌ 명령 처리 중 오류가 발생했습니다.\n"
+                f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
+
+
 
 
 async def main():
