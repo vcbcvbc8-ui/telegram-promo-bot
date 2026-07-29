@@ -34,6 +34,9 @@ SCHEDULE_FILE = Path(os.getenv("SCHEDULE_FILE", "schedule.txt"))
 FAILED_TARGETS_FILE = Path(os.getenv("FAILED_TARGETS_FILE", "failed_targets.txt"))
 NEXT_AUTO_RUN_FILE = Path(os.getenv("NEXT_AUTO_RUN_FILE", "next_auto_run.txt"))
 RUN_STATE_FILE = Path(os.getenv("RUN_STATE_FILE", "run_state.json"))
+LAST_AUTO_SLOT_FILE = Path(os.getenv("LAST_AUTO_SLOT_FILE", "last_auto_slot.txt"))
+SCHEDULER_POLL_SECONDS = max(5, int(os.getenv("SCHEDULER_POLL_SECONDS", "10")))
+SCHEDULE_GRACE_MINUTES = max(1, int(os.getenv("SCHEDULE_GRACE_MINUTES", "10")))
 KST = ZoneInfo("Asia/Seoul")
 AUTO_SEND_DEFAULT = os.getenv("AUTO_SEND_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_SCHEDULE = os.getenv("AUTO_SEND_SCHEDULE", "times:00:00,06:00,12:00,18:00").strip()
@@ -159,6 +162,90 @@ def calculate_and_store_next_auto_run(
 
     write_next_auto_run(candidate)
     return candidate
+
+
+
+
+def read_last_auto_slot() -> str:
+    if not LAST_AUTO_SLOT_FILE.exists():
+        return ""
+
+    try:
+        return LAST_AUTO_SLOT_FILE.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        logger.warning("마지막 자동 발송 회차 불러오기 실패: %s", exc)
+        return ""
+
+
+def write_last_auto_slot(slot_key: str) -> None:
+    try:
+        LAST_AUTO_SLOT_FILE.write_text(slot_key, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("마지막 자동 발송 회차 저장 실패: %s", exc)
+
+
+def scheduled_slot_due(now: datetime | None = None):
+    """
+    현재 시각에 실행해야 할 자동 발송 회차를 반환합니다.
+
+    반환값:
+    - 실행할 회차가 없으면 None
+    - 실행할 회차가 있으면 (slot_datetime, slot_key, next_run)
+    """
+    now = now or datetime.now(KST)
+    mode, value = parse_schedule(read_schedule())
+
+    if mode == "interval":
+        run_at = read_next_auto_run()
+        if run_at is None:
+            run_at = now + timedelta(hours=value)
+            write_next_auto_run(run_at)
+            return None
+
+        if now < run_at:
+            return None
+
+        slot_key = f"interval:{run_at.isoformat()}"
+        next_run = run_at + timedelta(hours=value)
+        while next_run <= now:
+            next_run += timedelta(hours=value)
+
+        return run_at, slot_key, next_run
+
+    grace = timedelta(minutes=SCHEDULE_GRACE_MINUTES)
+    candidates = [
+        now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        for hour, minute in value
+    ]
+    due_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate <= now and now - candidate <= grace
+    ]
+
+    if not due_candidates:
+        return None
+
+    slot = max(due_candidates)
+    slot_key = f"times:{slot.strftime('%Y-%m-%dT%H:%M')}"
+    next_run = next_auto_run(now)
+    return slot, slot_key, next_run
+
+
+def scheduler_next_display(now: datetime | None = None) -> datetime:
+    now = now or datetime.now(KST)
+    mode, value = parse_schedule(read_schedule())
+
+    if mode == "interval":
+        saved = read_next_auto_run()
+        if saved and saved > now:
+            return saved
+
+        candidate = now + timedelta(hours=value)
+        write_next_auto_run(candidate)
+        return candidate
+
+    return next_auto_run(now)
 
 
 
@@ -798,69 +885,96 @@ async def send_promotions(targets_override=None, run_label="발송"):
 async def automatic_scheduler():
     global send_task
 
-    logger.info("자동 스케줄러 시작")
+    logger.info(
+        "자동 스케줄러 시작 - 확인 간격:%s초, 예약 유예:%s분",
+        SCHEDULER_POLL_SECONDS,
+        SCHEDULE_GRACE_MINUTES,
+    )
+
+    last_logged_next = None
 
     while True:
         try:
             if not is_auto_send_enabled():
-                await asyncio.sleep(30)
+                last_logged_next = None
+                await asyncio.sleep(SCHEDULER_POLL_SECONDS)
                 continue
 
-            run_at = calculate_and_store_next_auto_run()
-            wait_seconds = max(
-                1,
-                (run_at - datetime.now(KST)).total_seconds(),
-            )
+            now = datetime.now(KST)
+            next_display = scheduler_next_display(now)
+            next_key = next_display.strftime("%Y-%m-%d %H:%M")
 
-            logger.info(
-                "다음 자동 발송: %s",
-                run_at.strftime("%Y-%m-%d %H:%M KST"),
-            )
-            await asyncio.sleep(wait_seconds)
+            if next_key != last_logged_next:
+                logger.info(
+                    "다음 자동 발송: %s",
+                    next_display.strftime("%Y-%m-%d %H:%M KST"),
+                )
+                last_logged_next = next_key
 
-            if not is_auto_send_enabled():
+            due = scheduled_slot_due(now)
+            if due is None:
+                await asyncio.sleep(SCHEDULER_POLL_SECONDS)
                 continue
 
-            # 다음 예약을 먼저 저장합니다.
-            # 시작 알림이나 실제 발송에서 오류가 발생해도 다음 일정은 유지됩니다.
-            next_run = calculate_and_store_next_auto_run(
-                previous_run=run_at
-            )
-            logger.info(
-                "그다음 자동 발송 예약: %s",
-                next_run.strftime("%Y-%m-%d %H:%M KST"),
-            )
+            slot_time, slot_key, next_run = due
+
+            # 같은 예약 회차를 중복 실행하지 않습니다.
+            if read_last_auto_slot() == slot_key:
+                await asyncio.sleep(SCHEDULER_POLL_SECONDS)
+                continue
+
+            # 회차를 먼저 기록해 재시작이나 반복 확인으로 중복 발송되는 것을 막습니다.
+            write_last_auto_slot(slot_key)
+
+            mode, value = parse_schedule(read_schedule())
+            if mode == "interval":
+                write_next_auto_run(next_run)
+
+            last_logged_next = None
 
             if send_task and not send_task.done():
                 logger.warning(
-                    "예약 시간이지만 기존 발송이 진행 중이라 이번 회차를 건너뜁니다."
+                    "예약 회차 %s: 기존 발송이 진행 중이라 이번 회차를 건너뜁니다.",
+                    slot_time.strftime("%Y-%m-%d %H:%M KST"),
                 )
                 await safe_control_message(
-                    "⚠️ 예약 시간이 되었지만 기존 발송이 진행 중이라 "
-                    "이번 자동 발송은 건너뜁니다.\n"
+                    "⚠️ 자동 발송 시간이 되었지만 기존 발송이 진행 중이라 "
+                    "이번 회차를 건너뜁니다.\n"
+                    f"예약 회차: {slot_time.strftime('%Y-%m-%d %H:%M KST')}\n"
                     f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
                 )
+                await asyncio.sleep(SCHEDULER_POLL_SECONDS)
                 continue
+
+            logger.info(
+                "자동 발송 회차 실행: %s",
+                slot_time.strftime("%Y-%m-%d %H:%M KST"),
+            )
 
             await safe_control_message(
                 "⏰ 예약 자동 발송을 시작합니다.\n"
-                f"시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')}\n"
+                f"예약 회차: {slot_time.strftime('%Y-%m-%d %H:%M KST')}\n"
+                f"실행 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')}\n"
                 f"다음 예약: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
             )
 
-            # 시작 알림 전송 성공 여부와 관계없이 실제 발송을 시작합니다.
             send_task = asyncio.create_task(
                 send_promotions(run_label="자동 발송")
             )
+
+            await asyncio.sleep(SCHEDULER_POLL_SECONDS)
 
         except asyncio.CancelledError:
             logger.warning("자동 스케줄러가 종료되었습니다.")
             raise
 
         except Exception as exc:
-            # 어떤 오류도 스케줄러 전체를 죽이지 못하게 합니다.
-            logger.exception("자동 스케줄러 오류 - 30초 후 계속: %s", exc)
-            await asyncio.sleep(30)
+            logger.exception(
+                "자동 스케줄러 오류 - %s초 후 다시 확인: %s",
+                SCHEDULER_POLL_SECONDS,
+                exc,
+            )
+            await asyncio.sleep(SCHEDULER_POLL_SECONDS)
 
 
 
@@ -976,11 +1090,19 @@ async def handle_control_message(event):
 
     elif command == "/autoon":
         set_auto_send_enabled(True)
-        next_run = calculate_and_store_next_auto_run()
+        mode, value = parse_schedule(read_schedule())
+
+        if mode == "interval":
+            next_run = datetime.now(KST) + timedelta(hours=value)
+            write_next_auto_run(next_run)
+        else:
+            next_run = next_auto_run()
+
         await event.respond(
             "✅ 자동 발송을 켰습니다.\n"
             f"일정: {schedule_description()}\n"
-            f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
+            f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}\n"
+            f"스케줄러 확인 간격: {SCHEDULER_POLL_SECONDS}초"
         )
 
     elif command.startswith("/schedule"):
@@ -1013,11 +1135,21 @@ async def handle_control_message(event):
 
             set_auto_send_enabled(True)
             NEXT_AUTO_RUN_FILE.unlink(missing_ok=True)
-            next_run = calculate_and_store_next_auto_run()
+            LAST_AUTO_SLOT_FILE.unlink(missing_ok=True)
+
+            mode, value = parse_schedule(read_schedule())
+            if mode == "interval":
+                next_run = datetime.now(KST) + timedelta(hours=value)
+                write_next_auto_run(next_run)
+            else:
+                next_run = next_auto_run()
+
             await event.respond(
                 "✅ 자동 발송 일정을 저장하고 자동 발송을 켰습니다.\n"
                 f"일정: {schedule_description()}\n"
-                f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
+                f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}\n"
+                "변경된 일정은 최대 "
+                f"{SCHEDULER_POLL_SECONDS}초 안에 반영됩니다."
             )
         except Exception:
             await event.respond(
@@ -1073,7 +1205,7 @@ async def handle_control_message(event):
         auto_enabled = is_auto_send_enabled()
 
         if auto_enabled:
-            next_run = calculate_and_store_next_auto_run()
+            next_run = scheduler_next_display()
             auto_line = (
                 f"켜짐 / {schedule_description()} / "
                 f"다음: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
@@ -1108,6 +1240,7 @@ async def handle_control_message(event):
             f"그룹 간 발송 간격: {SEND_INTERVAL}초\n"
             f"그룹별 제한 시간: {SEND_TIMEOUT}초\n"
             f"최대 FloodWait 대기: {MAX_FLOOD_WAIT}초\n"
+            f"스케줄러 확인: {SCHEDULER_POLL_SECONDS}초마다\n"
             f"자동 발송: {auto_line}"
         )
 
@@ -1122,7 +1255,7 @@ async def handle_control_message(event):
             )
 
             if is_auto_send_enabled():
-                next_run = calculate_and_store_next_auto_run()
+                next_run = scheduler_next_display()
                 next_line = next_run.strftime("%Y-%m-%d %H:%M KST")
             else:
                 next_line = "자동 발송 꺼짐"
@@ -1228,11 +1361,18 @@ async def main():
     logger.info("로그인 완료: %s (%s)", me.first_name, me.id)
     scheduler_task = asyncio.create_task(automatic_scheduler())
     auto_status = "켜짐" if is_auto_send_enabled() else "꺼짐"
+    next_line = (
+        scheduler_next_display().strftime("%Y-%m-%d %H:%M KST")
+        if is_auto_send_enabled()
+        else "자동 발송 꺼짐"
+    )
     await safe_control_message(
         "✅ 홍보 프로그램이 실행되었습니다.\n"
         "저장한 메시지에 /help를 입력하세요.\n"
         f"자동 발송: {auto_status}\n"
-        f"일정: {schedule_description()}"
+        f"일정: {schedule_description()}\n"
+        f"다음 발송: {next_line}\n"
+        f"스케줄러 확인 간격: {SCHEDULER_POLL_SECONDS}초"
     )
     await client.run_until_disconnected()
 
