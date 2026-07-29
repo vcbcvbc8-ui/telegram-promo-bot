@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
@@ -31,6 +32,8 @@ PROMO2_MESSAGE_ID_FILE = Path(os.getenv("PROMO2_MESSAGE_ID_FILE", "promo2_messag
 AUTO_SEND_ENABLED_FILE = Path(os.getenv("AUTO_SEND_ENABLED_FILE", "auto_send_enabled.txt"))
 SCHEDULE_FILE = Path(os.getenv("SCHEDULE_FILE", "schedule.txt"))
 FAILED_TARGETS_FILE = Path(os.getenv("FAILED_TARGETS_FILE", "failed_targets.txt"))
+NEXT_AUTO_RUN_FILE = Path(os.getenv("NEXT_AUTO_RUN_FILE", "next_auto_run.txt"))
+RUN_STATE_FILE = Path(os.getenv("RUN_STATE_FILE", "run_state.json"))
 KST = ZoneInfo("Asia/Seoul")
 AUTO_SEND_DEFAULT = os.getenv("AUTO_SEND_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_SCHEDULE = os.getenv("AUTO_SEND_SCHEDULE", "times:00:00,06:00,12:00,18:00").strip()
@@ -50,6 +53,113 @@ progress_total = 0
 progress_success = 0
 progress_failed = 0
 progress_started_at = None
+last_run_status = "대기 중"
+last_run_finished_at = None
+
+
+
+def save_run_state(status: str, finished_at: datetime | None = None) -> None:
+    global last_run_status, last_run_finished_at
+
+    last_run_status = status
+    if finished_at is not None:
+        last_run_finished_at = finished_at
+
+    data = {
+        "status": last_run_status,
+        "finished_at": (
+            last_run_finished_at.isoformat()
+            if last_run_finished_at is not None
+            else None
+        ),
+        "progress_current": progress_current,
+        "progress_total": progress_total,
+        "progress_success": progress_success,
+        "progress_failed": progress_failed,
+    }
+
+    try:
+        RUN_STATE_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("실행 상태 저장 실패: %s", exc)
+
+
+def load_run_state() -> None:
+    global last_run_status, last_run_finished_at
+    global progress_current, progress_total, progress_success, progress_failed
+
+    if not RUN_STATE_FILE.exists():
+        return
+
+    try:
+        data = json.loads(RUN_STATE_FILE.read_text(encoding="utf-8"))
+        last_run_status = str(data.get("status") or "대기 중")
+
+        finished_text = data.get("finished_at")
+        if finished_text:
+            last_run_finished_at = datetime.fromisoformat(finished_text)
+
+        progress_current = int(data.get("progress_current") or 0)
+        progress_total = int(data.get("progress_total") or 0)
+        progress_success = int(data.get("progress_success") or 0)
+        progress_failed = int(data.get("progress_failed") or 0)
+    except Exception as exc:
+        logger.warning("실행 상태 불러오기 실패: %s", exc)
+
+
+def write_next_auto_run(run_at: datetime) -> None:
+    try:
+        NEXT_AUTO_RUN_FILE.write_text(run_at.isoformat(), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("다음 자동 발송 시간 저장 실패: %s", exc)
+
+
+def read_next_auto_run() -> datetime | None:
+    if not NEXT_AUTO_RUN_FILE.exists():
+        return None
+
+    try:
+        value = NEXT_AUTO_RUN_FILE.read_text(encoding="utf-8").strip()
+        if not value:
+            return None
+        run_at = datetime.fromisoformat(value)
+        if run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=KST)
+        return run_at.astimezone(KST)
+    except Exception as exc:
+        logger.warning("다음 자동 발송 시간 불러오기 실패: %s", exc)
+        return None
+
+
+def calculate_and_store_next_auto_run(
+    now: datetime | None = None,
+    previous_run: datetime | None = None,
+) -> datetime:
+    now = now or datetime.now(KST)
+    mode, value = parse_schedule(read_schedule())
+
+    if mode == "interval":
+        if previous_run is None:
+            candidate = read_next_auto_run()
+
+            if candidate is None:
+                candidate = now + timedelta(hours=value)
+            else:
+                while candidate <= now:
+                    candidate += timedelta(hours=value)
+        else:
+            candidate = previous_run + timedelta(hours=value)
+            while candidate <= now:
+                candidate += timedelta(hours=value)
+    else:
+        candidate = next_auto_run(now)
+
+    write_next_auto_run(candidate)
+    return candidate
+
 
 
 def read_promo_text() -> str:
@@ -280,6 +390,54 @@ async def control_message(text: str):
     await client.send_message("me", text)
 
 
+async def safe_control_message(text: str) -> bool:
+    """알림 전송 실패가 발송 작업이나 자동 스케줄러를 멈추지 않도록 보호합니다."""
+    try:
+        await asyncio.wait_for(
+            client.send_message("me", text),
+            timeout=SEND_TIMEOUT,
+        )
+        return True
+    except FloodWaitError as exc:
+        logger.warning(
+            "저장된 메시지 알림 FloodWait %s초 - 알림만 생략",
+            int(exc.seconds),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("저장된 메시지 알림 시간 초과 - 알림만 생략")
+    except Exception as exc:
+        logger.exception("저장된 메시지 알림 실패 - 알림만 생략: %s", exc)
+
+    return False
+
+
+async def safe_send_failed_file(caption: str) -> bool:
+    if not FAILED_TARGETS_FILE.exists():
+        return False
+
+    try:
+        await asyncio.wait_for(
+            client.send_file(
+                "me",
+                FAILED_TARGETS_FILE,
+                caption=caption,
+            ),
+            timeout=SEND_TIMEOUT,
+        )
+        return True
+    except FloodWaitError as exc:
+        logger.warning(
+            "실패 목록 파일 전송 FloodWait %s초 - 파일 전송만 생략",
+            int(exc.seconds),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("실패 목록 파일 전송 시간 초과 - 파일 전송만 생략")
+    except Exception as exc:
+        logger.exception("실패 목록 파일 전송 실패 - 파일 전송만 생략: %s", exc)
+
+    return False
+
+
 async def save_uploaded_file(event) -> bool:
     """저장된 메시지에 올린 설정 파일을 Railway 실행 폴더에 저장합니다."""
     if not event.file:
@@ -391,7 +549,7 @@ def read_failed_targets() -> list[str]:
 async def send_promotions(targets_override=None, run_label="발송"):
     global stop_requested
     global progress_current, progress_total, progress_success, progress_failed
-    global progress_started_at
+    global progress_started_at, last_run_status, last_run_finished_at
 
     stop_requested = False
     progress_current = 0
@@ -399,177 +557,310 @@ async def send_promotions(targets_override=None, run_label="발송"):
     progress_success = 0
     progress_failed = 0
     progress_started_at = datetime.now(KST)
+    failed_targets = []
+    total = 0
+    final_status = "오류 종료"
+
+    save_run_state(f"{run_label} 준비 중")
 
     try:
-        targets = list(targets_override) if targets_override is not None else read_targets()
-        promo1 = await get_saved_promo_message(
-            PROMO1_MESSAGE_ID_FILE, "사진+텍스트 홍보"
-        )
-        promo2 = await get_saved_promo_message(
-            PROMO2_MESSAGE_ID_FILE, "텍스트 전용 홍보"
-        )
-        text_value = None if promo1 else read_promo_text()
-    except Exception as exc:
-        await control_message(f"❌ 설정 오류\n{exc}")
-        return
-
-    image_exists = PROMO_IMAGE_FILE.exists() and promo1 is None
-    total = len(targets)
-    progress_total = total
-    failed_targets = []
-
-    await control_message(
-        f"🚀 {run_label} 시작\n대상: {total}개\n간격: {SEND_INTERVAL}초\n"
-        f"홍보 방식: {'사진+텍스트 / 텍스트 자동 구분' if promo1 else ('이미지+문구' if image_exists else '문구')}"
-    )
-
-    for index, target in enumerate(targets, start=1):
-        if stop_requested:
-            save_failed_targets(failed_targets)
-            await control_message(
-                f"⛔ {run_label} 중지\n"
-                f"진행: {progress_current}/{total}\n"
-                f"성공: {progress_success}개\n"
-                f"실패: {progress_failed}개"
+        try:
+            targets = (
+                list(targets_override)
+                if targets_override is not None
+                else read_targets()
             )
+            promo1 = await get_saved_promo_message(
+                PROMO1_MESSAGE_ID_FILE,
+                "사진+텍스트 홍보",
+            )
+            promo2 = await get_saved_promo_message(
+                PROMO2_MESSAGE_ID_FILE,
+                "텍스트 전용 홍보",
+            )
+            text_value = None if promo1 else read_promo_text()
+        except Exception as exc:
+            final_status = "설정 오류"
+            logger.exception("%s 설정 오류: %s", run_label, exc)
+            await safe_control_message(f"❌ 설정 오류\n{exc}")
             return
 
-        try:
-            key = int(target) if target.lstrip("-").isdigit() else target
-            entity = await asyncio.wait_for(client.get_entity(key), timeout=SEND_TIMEOUT)
+        image_exists = PROMO_IMAGE_FILE.exists() and promo1 is None
+        total = len(targets)
+        progress_total = total
+        save_run_state(f"{run_label} 진행 중")
 
-            mode = await asyncio.wait_for(
-                send_to_entity(entity, promo1, promo2, text_value, image_exists),
-                timeout=SEND_TIMEOUT,
-            )
-            progress_success += 1
-            logger.info("[%s/%s] 성공: %s (%s)", index, total, target, mode)
+        await safe_control_message(
+            f"🚀 {run_label} 시작\n"
+            f"대상: {total}개\n"
+            f"간격: {SEND_INTERVAL}초\n"
+            f"홍보 방식: "
+            f"{'사진+텍스트 / 텍스트 자동 구분' if promo1 else ('이미지+문구' if image_exists else '문구')}"
+        )
 
-        except FloodWaitError as exc:
-            wait_seconds = int(exc.seconds)
+        for index, target in enumerate(targets, start=1):
+            if stop_requested:
+                final_status = "사용자 중지"
+                break
 
-            if wait_seconds <= MAX_FLOOD_WAIT:
-                logger.warning(
-                    "[%s/%s] 짧은 FloodWait %s초: %s",
+            try:
+                key = int(target) if target.lstrip("-").isdigit() else target
+                entity = await asyncio.wait_for(
+                    client.get_entity(key),
+                    timeout=SEND_TIMEOUT,
+                )
+
+                mode = await asyncio.wait_for(
+                    send_to_entity(
+                        entity,
+                        promo1,
+                        promo2,
+                        text_value,
+                        image_exists,
+                    ),
+                    timeout=SEND_TIMEOUT,
+                )
+                progress_success += 1
+                logger.info(
+                    "[%s/%s] 성공: %s (%s)",
                     index,
                     total,
-                    wait_seconds,
                     target,
+                    mode,
                 )
-                await asyncio.sleep(wait_seconds + 1)
 
-                try:
-                    key = int(target) if target.lstrip("-").isdigit() else target
-                    entity = await asyncio.wait_for(
-                        client.get_entity(key),
-                        timeout=SEND_TIMEOUT,
-                    )
-                    mode = await asyncio.wait_for(
-                        send_to_entity(
-                            entity,
-                            promo1,
-                            promo2,
-                            text_value,
-                            image_exists,
-                        ),
-                        timeout=SEND_TIMEOUT,
-                    )
-                    progress_success += 1
-                    logger.info(
-                        "[%s/%s] 재시도 성공: %s (%s)",
+            except FloodWaitError as exc:
+                wait_seconds = int(exc.seconds)
+
+                if wait_seconds <= MAX_FLOOD_WAIT:
+                    logger.warning(
+                        "[%s/%s] 짧은 FloodWait %s초: %s",
                         index,
                         total,
+                        wait_seconds,
                         target,
-                        mode,
                     )
-                except Exception as retry_exc:
+                    await asyncio.sleep(wait_seconds + 1)
+
+                    try:
+                        key = (
+                            int(target)
+                            if target.lstrip("-").isdigit()
+                            else target
+                        )
+                        entity = await asyncio.wait_for(
+                            client.get_entity(key),
+                            timeout=SEND_TIMEOUT,
+                        )
+                        mode = await asyncio.wait_for(
+                            send_to_entity(
+                                entity,
+                                promo1,
+                                promo2,
+                                text_value,
+                                image_exists,
+                            ),
+                            timeout=SEND_TIMEOUT,
+                        )
+                        progress_success += 1
+                        logger.info(
+                            "[%s/%s] 재시도 성공: %s (%s)",
+                            index,
+                            total,
+                            target,
+                            mode,
+                        )
+                    except Exception as retry_exc:
+                        progress_failed += 1
+                        failed_targets.append(target)
+                        logger.exception(
+                            "[%s/%s] 재시도 실패 %s: %s",
+                            index,
+                            total,
+                            target,
+                            retry_exc,
+                        )
+                else:
                     progress_failed += 1
                     failed_targets.append(target)
-                    logger.exception("재시도 실패 %s: %s", target, retry_exc)
-            else:
+                    logger.warning(
+                        "[%s/%s] 긴 FloodWait %s초로 건너뜀: %s",
+                        index,
+                        total,
+                        wait_seconds,
+                        target,
+                    )
+
+            except asyncio.TimeoutError:
                 progress_failed += 1
                 failed_targets.append(target)
                 logger.warning(
-                    "[%s/%s] 긴 FloodWait %s초로 건너뜀: %s",
+                    "[%s/%s] 시간 초과 %s: %s초 안에 응답 없음",
                     index,
                     total,
-                    wait_seconds,
                     target,
+                    SEND_TIMEOUT,
                 )
 
-        except asyncio.TimeoutError:
-            progress_failed += 1
-            failed_targets.append(target)
-            logger.warning(
-                "[%s/%s] 시간 초과 %s: %s초 안에 응답 없음",
-                index,
-                total,
-                target,
-                SEND_TIMEOUT,
-            )
+            except (RPCError, ValueError, TypeError) as exc:
+                progress_failed += 1
+                failed_targets.append(target)
+                logger.warning(
+                    "[%s/%s] 실패 %s: %s",
+                    index,
+                    total,
+                    target,
+                    exc,
+                )
 
-        except (RPCError, ValueError, TypeError) as exc:
-            progress_failed += 1
-            failed_targets.append(target)
-            logger.warning("[%s/%s] 실패 %s: %s", index, total, target, exc)
+            except Exception as exc:
+                progress_failed += 1
+                failed_targets.append(target)
+                logger.exception(
+                    "[%s/%s] 예외 %s: %s",
+                    index,
+                    total,
+                    target,
+                    exc,
+                )
 
-        except Exception as exc:
-            progress_failed += 1
-            failed_targets.append(target)
-            logger.exception("[%s/%s] 예외 %s: %s", index, total, target, exc)
+            finally:
+                progress_current = index
+                save_failed_targets(failed_targets)
+                save_run_state(f"{run_label} 진행 중")
 
-        progress_current = index
+            if index < total and not stop_requested:
+                await asyncio.sleep(SEND_INTERVAL)
+
+        if stop_requested:
+            final_status = "사용자 중지"
+        else:
+            final_status = "완료"
+
+    except asyncio.CancelledError:
+        final_status = "배포 또는 재시작으로 중단"
+        logger.warning("%s 작업이 취소되었습니다.", run_label)
+        raise
+
+    except Exception as exc:
+        final_status = "예상하지 못한 오류 종료"
+        logger.exception("%s 전체 작업 오류: %s", run_label, exc)
+
+    finally:
+        finished_at = datetime.now(KST)
+        last_run_finished_at = finished_at
+
+        if progress_started_at:
+            elapsed = finished_at - progress_started_at
+            elapsed_minutes = int(elapsed.total_seconds() // 60)
+            elapsed_seconds = int(elapsed.total_seconds() % 60)
+        else:
+            elapsed_minutes = 0
+            elapsed_seconds = 0
+
         save_failed_targets(failed_targets)
+        save_run_state(final_status, finished_at=finished_at)
 
-        if index < total and not stop_requested:
-            await asyncio.sleep(SEND_INTERVAL)
-
-    elapsed = datetime.now(KST) - progress_started_at
-    elapsed_minutes = int(elapsed.total_seconds() // 60)
-    elapsed_seconds = int(elapsed.total_seconds() % 60)
-
-    await control_message(
-        f"✅ {run_label} 완료\n"
-        f"성공: {progress_success}개\n"
-        f"실패: {progress_failed}개\n"
-        f"전체: {total}개\n"
-        f"소요 시간: {elapsed_minutes}분 {elapsed_seconds}초"
-    )
-
-    if failed_targets:
-        await client.send_file(
-            "me",
-            FAILED_TARGETS_FILE,
-            caption=f"{run_label} 후에도 실패한 그룹 {len(failed_targets)}개 목록입니다.",
+        logger.info(
+            "%s 종료 - 상태:%s 성공:%s 실패:%s 전체:%s 소요:%s분 %s초",
+            run_label,
+            final_status,
+            progress_success,
+            progress_failed,
+            total,
+            elapsed_minutes,
+            elapsed_seconds,
         )
+
+        if final_status == "완료":
+            result_title = f"✅ {run_label} 완료"
+        elif final_status == "사용자 중지":
+            result_title = f"⛔ {run_label} 중지"
+        else:
+            result_title = f"⚠️ {run_label} 종료"
+
+        await safe_control_message(
+            f"{result_title}\n"
+            f"상태: {final_status}\n"
+            f"성공: {progress_success}개\n"
+            f"실패: {progress_failed}개\n"
+            f"처리: {progress_current}/{total}\n"
+            f"소요 시간: {elapsed_minutes}분 {elapsed_seconds}초"
+        )
+
+        if failed_targets:
+            await safe_send_failed_file(
+                f"{run_label} 후에도 실패한 그룹 "
+                f"{len(failed_targets)}개 목록입니다."
+            )
 
 
 async def automatic_scheduler():
     global send_task
 
+    logger.info("자동 스케줄러 시작")
+
     while True:
-        if not is_auto_send_enabled():
-            await asyncio.sleep(60)
-            continue
+        try:
+            if not is_auto_send_enabled():
+                await asyncio.sleep(30)
+                continue
 
-        run_at = next_auto_run()
-        wait_seconds = max(1, (run_at - datetime.now(KST)).total_seconds())
-        logger.info("다음 자동 발송: %s", run_at.strftime("%Y-%m-%d %H:%M KST"))
-        await asyncio.sleep(wait_seconds)
+            run_at = calculate_and_store_next_auto_run()
+            wait_seconds = max(
+                1,
+                (run_at - datetime.now(KST)).total_seconds(),
+            )
 
-        if not is_auto_send_enabled():
-            continue
+            logger.info(
+                "다음 자동 발송: %s",
+                run_at.strftime("%Y-%m-%d %H:%M KST"),
+            )
+            await asyncio.sleep(wait_seconds)
 
-        if send_task and not send_task.done():
-            await control_message("⚠️ 예약 시간이 되었지만 기존 발송이 진행 중이라 이번 자동 발송은 건너뜁니다.")
-            continue
+            if not is_auto_send_enabled():
+                continue
 
-        await control_message(
-            f"⏰ 예약 자동 발송을 시작합니다.\n"
-            f"시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')}"
-        )
-        send_task = asyncio.create_task(send_promotions())
+            # 다음 예약을 먼저 저장합니다.
+            # 시작 알림이나 실제 발송에서 오류가 발생해도 다음 일정은 유지됩니다.
+            next_run = calculate_and_store_next_auto_run(
+                previous_run=run_at
+            )
+            logger.info(
+                "그다음 자동 발송 예약: %s",
+                next_run.strftime("%Y-%m-%d %H:%M KST"),
+            )
 
+            if send_task and not send_task.done():
+                logger.warning(
+                    "예약 시간이지만 기존 발송이 진행 중이라 이번 회차를 건너뜁니다."
+                )
+                await safe_control_message(
+                    "⚠️ 예약 시간이 되었지만 기존 발송이 진행 중이라 "
+                    "이번 자동 발송은 건너뜁니다.\n"
+                    f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
+                )
+                continue
+
+            await safe_control_message(
+                "⏰ 예약 자동 발송을 시작합니다.\n"
+                f"시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')}\n"
+                f"다음 예약: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
+            )
+
+            # 시작 알림 전송 성공 여부와 관계없이 실제 발송을 시작합니다.
+            send_task = asyncio.create_task(
+                send_promotions(run_label="자동 발송")
+            )
+
+        except asyncio.CancelledError:
+            logger.warning("자동 스케줄러가 종료되었습니다.")
+            raise
+
+        except Exception as exc:
+            # 어떤 오류도 스케줄러 전체를 죽이지 못하게 합니다.
+            logger.exception("자동 스케줄러 오류 - 30초 후 계속: %s", exc)
+            await asyncio.sleep(30)
 
 
 
@@ -685,10 +976,11 @@ async def handle_control_message(event):
 
     elif command == "/autoon":
         set_auto_send_enabled(True)
+        next_run = calculate_and_store_next_auto_run()
         await event.respond(
             "✅ 자동 발송을 켰습니다.\n"
             f"일정: {schedule_description()}\n"
-            f"다음 발송: {next_auto_run().strftime('%Y-%m-%d %H:%M KST')}"
+            f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
         )
 
     elif command.startswith("/schedule"):
@@ -720,10 +1012,12 @@ async def handle_control_message(event):
                 write_schedule("times:" + ",".join(parsed_times))
 
             set_auto_send_enabled(True)
+            NEXT_AUTO_RUN_FILE.unlink(missing_ok=True)
+            next_run = calculate_and_store_next_auto_run()
             await event.respond(
                 "✅ 자동 발송 일정을 저장하고 자동 발송을 켰습니다.\n"
                 f"일정: {schedule_description()}\n"
-                f"다음 발송: {next_auto_run().strftime('%Y-%m-%d %H:%M KST')}"
+                f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
             )
         except Exception:
             await event.respond(
@@ -777,10 +1071,16 @@ async def handle_control_message(event):
     elif command == "/status":
         running = bool(send_task and not send_task.done())
         auto_enabled = is_auto_send_enabled()
-        auto_line = (
-            f"켜짐 / {schedule_description()} / 다음: {next_auto_run().strftime('%Y-%m-%d %H:%M KST')}"
-            if auto_enabled else "꺼짐"
-        )
+
+        if auto_enabled:
+            next_run = calculate_and_store_next_auto_run()
+            auto_line = (
+                f"켜짐 / {schedule_description()} / "
+                f"다음: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
+            )
+        else:
+            auto_line = "꺼짐"
+
         if running and progress_total:
             remaining = max(0, progress_total - progress_current)
             progress_line = (
@@ -789,11 +1089,22 @@ async def handle_control_message(event):
                 f"남음: {remaining}개\n"
             )
         else:
-            progress_line = ""
+            progress_line = (
+                f"마지막 상태: {last_run_status}\n"
+                f"마지막 결과: 성공 {progress_success}개 / "
+                f"실패 {progress_failed}개\n"
+            )
+
+        finished_line = (
+            last_run_finished_at.strftime("%Y-%m-%d %H:%M KST")
+            if last_run_finished_at
+            else "기록 없음"
+        )
 
         await event.respond(
             f"상태: {'발송 중' if running else '대기 중'}\n"
             f"{progress_line}"
+            f"마지막 종료: {finished_line}\n"
             f"그룹 간 발송 간격: {SEND_INTERVAL}초\n"
             f"그룹별 제한 시간: {SEND_TIMEOUT}초\n"
             f"최대 FloodWait 대기: {MAX_FLOOD_WAIT}초\n"
@@ -804,20 +1115,44 @@ async def handle_control_message(event):
         running = bool(send_task and not send_task.done())
 
         if not running or not progress_total:
+            finished_line = (
+                last_run_finished_at.strftime("%Y-%m-%d %H:%M KST")
+                if last_run_finished_at
+                else "기록 없음"
+            )
+
+            if is_auto_send_enabled():
+                next_run = calculate_and_store_next_auto_run()
+                next_line = next_run.strftime("%Y-%m-%d %H:%M KST")
+            else:
+                next_line = "자동 발송 꺼짐"
+
             await event.respond(
-                "현재 진행 중인 발송이 없습니다.\n"
-                f"마지막 상태: 성공 {progress_success}개 / 실패 {progress_failed}개"
+                "📋 현재 진행 중인 발송이 없습니다.\n"
+                f"마지막 상태: {last_run_status}\n"
+                f"마지막 결과: 성공 {progress_success}개 / "
+                f"실패 {progress_failed}개\n"
+                f"마지막 종료: {finished_line}\n"
+                f"다음 자동 발송: {next_line}"
             )
             return
 
         remaining = max(0, progress_total - progress_current)
-        percent = int((progress_current / progress_total) * 100) if progress_total else 0
+        percent = (
+            int((progress_current / progress_total) * 100)
+            if progress_total
+            else 0
+        )
 
         elapsed_seconds = 0
         if progress_started_at:
             elapsed_seconds = max(
                 0,
-                int((datetime.now(KST) - progress_started_at).total_seconds()),
+                int(
+                    (
+                        datetime.now(KST) - progress_started_at
+                    ).total_seconds()
+                ),
             )
 
         if progress_current > 0:
@@ -832,7 +1167,8 @@ async def handle_control_message(event):
             f"성공: {progress_success}개\n"
             f"실패: {progress_failed}개\n"
             f"남음: {remaining}개\n"
-            f"예상 남은 시간: 약 {estimated_seconds // 60}분 {estimated_seconds % 60}초"
+            f"예상 남은 시간: 약 "
+            f"{estimated_seconds // 60}분 {estimated_seconds % 60}초"
         )
 
     elif command == "/files":
@@ -886,12 +1222,13 @@ async def control_handler(event):
 
 async def main():
     global scheduler_task
+    load_run_state()
     await client.start()
     me = await client.get_me()
     logger.info("로그인 완료: %s (%s)", me.first_name, me.id)
     scheduler_task = asyncio.create_task(automatic_scheduler())
     auto_status = "켜짐" if is_auto_send_enabled() else "꺼짐"
-    await control_message(
+    await safe_control_message(
         "✅ 홍보 프로그램이 실행되었습니다.\n"
         "저장한 메시지에 /help를 입력하세요.\n"
         f"자동 발송: {auto_status}\n"
