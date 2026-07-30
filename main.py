@@ -51,6 +51,7 @@ send_task = None
 stop_requested = False
 waiting_for_promo = None
 scheduler_task = None
+self_user_id = None
 progress_current = 0
 progress_total = 0
 progress_success = 0
@@ -1326,10 +1327,22 @@ async def handle_control_message(event):
         )
 
 
-@client.on(events.NewMessage(chats="me", outgoing=True))
+@client.on(events.NewMessage(outgoing=True))
 async def control_handler(event):
+    global self_user_id
+
     try:
+        # Telethon/Railway 환경에 따라 chats="me" 필터가 저장한 메시지를
+        # 놓치는 경우가 있어, 모든 발신 메시지를 받은 뒤 직접 판별합니다.
+        if self_user_id is None:
+            me = await client.get_me()
+            self_user_id = me.id
+
+        if event.chat_id != self_user_id:
+            return
+
         await handle_control_message(event)
+
     except Exception as exc:
         logger.exception("명령 처리 오류: %s", exc)
         try:
@@ -1344,10 +1357,11 @@ async def control_handler(event):
 
 
 async def main():
-    global scheduler_task
+    global scheduler_task, self_user_id
     load_run_state()
     await client.start()
     me = await client.get_me()
+    self_user_id = me.id
     logger.info("로그인 완료: %s (%s)", me.first_name, me.id)
     scheduler_task = asyncio.create_task(automatic_scheduler())
     auto_status = "켜짐" if is_auto_send_enabled() else "꺼짐"
@@ -1357,7 +1371,7 @@ async def main():
         else "자동 발송 꺼짐"
     )
     await safe_control_message(
-        "✅ 홍보 프로그램 단순 스케줄러 v4가 실행되었습니다.\n"
+        "✅ 홍보 프로그램 단순 스케줄러 v4.1이 실행되었습니다.\n"
         "저장한 메시지에 /help를 입력하세요.\n"
         f"자동 발송: {auto_status}\n"
         f"일정: {schedule_description()}\n"
