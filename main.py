@@ -918,30 +918,17 @@ async def automatic_scheduler():
 
             slot_time, slot_key, next_run = due
 
-            # 같은 예약 회차를 중복 실행하지 않습니다.
+            # 이미 실제로 시작한 회차만 중복 방지합니다.
             if read_last_auto_slot() == slot_key:
                 await asyncio.sleep(SCHEDULER_POLL_SECONDS)
                 continue
 
-            # 회차를 먼저 기록해 재시작이나 반복 확인으로 중복 발송되는 것을 막습니다.
-            write_last_auto_slot(slot_key)
-
-            mode, value = parse_schedule(read_schedule())
-            if mode == "interval":
-                write_next_auto_run(next_run)
-
-            last_logged_next = None
-
+            # 기존 발송 중이면 예약을 지우거나 다음 시간으로 넘기지 않습니다.
+            # 작업이 끝난 뒤 같은 예약 회차를 다시 실행합니다.
             if send_task and not send_task.done():
                 logger.warning(
-                    "예약 회차 %s: 기존 발송이 진행 중이라 이번 회차를 건너뜁니다.",
+                    "예약 회차 %s 대기 중: 기존 발송 종료 후 자동 시작합니다.",
                     slot_time.strftime("%Y-%m-%d %H:%M KST"),
-                )
-                await safe_control_message(
-                    "⚠️ 자동 발송 시간이 되었지만 기존 발송이 진행 중이라 "
-                    "이번 회차를 건너뜁니다.\n"
-                    f"예약 회차: {slot_time.strftime('%Y-%m-%d %H:%M KST')}\n"
-                    f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
                 )
                 await asyncio.sleep(SCHEDULER_POLL_SECONDS)
                 continue
@@ -951,15 +938,30 @@ async def automatic_scheduler():
                 slot_time.strftime("%Y-%m-%d %H:%M KST"),
             )
 
-            await safe_control_message(
-                "⏰ 예약 자동 발송을 시작합니다.\n"
-                f"예약 회차: {slot_time.strftime('%Y-%m-%d %H:%M KST')}\n"
-                f"실행 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')}\n"
-                f"다음 예약: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
-            )
-
-            send_task = asyncio.create_task(
+            # 가장 먼저 실제 발송 작업을 생성합니다.
+            # 알림 실패나 Railway 순간 오류 때문에 예약만 다음 시간으로 넘어가는 것을 막습니다.
+            new_task = asyncio.create_task(
                 send_promotions(run_label="자동 발송")
+            )
+            send_task = new_task
+
+            # 작업 생성이 성공한 후에만 이번 회차 완료 표시와 다음 예약을 저장합니다.
+            write_last_auto_slot(slot_key)
+
+            mode, value = parse_schedule(read_schedule())
+            if mode == "interval":
+                write_next_auto_run(next_run)
+
+            last_logged_next = None
+
+            # 시작 알림은 발송 작업과 분리해 알림 오류가 실제 발송을 막지 못하게 합니다.
+            asyncio.create_task(
+                safe_control_message(
+                    "⏰ 예약 자동 발송을 시작합니다.\n"
+                    f"예약 회차: {slot_time.strftime('%Y-%m-%d %H:%M KST')}\n"
+                    f"실행 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M KST')}\n"
+                    f"다음 예약: {next_run.strftime('%Y-%m-%d %H:%M KST')}"
+                )
             )
 
             await asyncio.sleep(SCHEDULER_POLL_SECONDS)
@@ -1367,7 +1369,7 @@ async def main():
         else "자동 발송 꺼짐"
     )
     await safe_control_message(
-        "✅ 홍보 프로그램이 실행되었습니다.\n"
+        "✅ 홍보 프로그램 안정판 v2가 실행되었습니다.\n"
         "저장한 메시지에 /help를 입력하세요.\n"
         f"자동 발송: {auto_status}\n"
         f"일정: {schedule_description()}\n"
