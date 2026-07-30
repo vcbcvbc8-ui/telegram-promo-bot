@@ -59,6 +59,10 @@ progress_started_at = None
 last_run_status = "대기 중"
 last_run_finished_at = None
 
+auto_send_enabled_runtime = AUTO_SEND_DEFAULT
+schedule_runtime = DEFAULT_SCHEDULE
+last_auto_slot_runtime = ""
+
 
 
 def save_run_state(status: str, finished_at: datetime | None = None) -> None:
@@ -167,52 +171,36 @@ def calculate_and_store_next_auto_run(
 
 
 def read_last_auto_slot() -> str:
-    if not LAST_AUTO_SLOT_FILE.exists():
-        return ""
-
-    try:
-        return LAST_AUTO_SLOT_FILE.read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        logger.warning("마지막 자동 발송 회차 불러오기 실패: %s", exc)
-        return ""
+    return last_auto_slot_runtime
 
 
 def write_last_auto_slot(slot_key: str) -> None:
-    try:
-        LAST_AUTO_SLOT_FILE.write_text(slot_key, encoding="utf-8")
-    except Exception as exc:
-        logger.warning("마지막 자동 발송 회차 저장 실패: %s", exc)
+    global last_auto_slot_runtime
+    last_auto_slot_runtime = slot_key
+
+
+def interval_slot_at_or_before(now: datetime, hours: int) -> datetime:
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed_seconds = max(0, int((now - midnight).total_seconds()))
+    interval_seconds = hours * 3600
+    slot_index = elapsed_seconds // interval_seconds
+    return midnight + timedelta(seconds=slot_index * interval_seconds)
 
 
 def scheduled_slot_due(now: datetime | None = None):
-    """
-    현재 시각에 실행해야 할 자동 발송 회차를 반환합니다.
-
-    반환값:
-    - 실행할 회차가 없으면 None
-    - 실행할 회차가 있으면 (slot_datetime, slot_key, next_run)
-    """
     now = now or datetime.now(KST)
     mode, value = parse_schedule(read_schedule())
+    grace = timedelta(minutes=SCHEDULE_GRACE_MINUTES)
 
     if mode == "interval":
-        run_at = read_next_auto_run()
-        if run_at is None:
-            run_at = now + timedelta(hours=value)
-            write_next_auto_run(run_at)
+        slot = interval_slot_at_or_before(now, value)
+        if now - slot > grace:
             return None
 
-        if now < run_at:
-            return None
+        slot_key = f"interval:{value}:{slot.strftime('%Y-%m-%dT%H:%M')}"
+        next_run = slot + timedelta(hours=value)
+        return slot, slot_key, next_run
 
-        slot_key = f"interval:{run_at.isoformat()}"
-        next_run = run_at + timedelta(hours=value)
-        while next_run <= now:
-            next_run += timedelta(hours=value)
-
-        return run_at, slot_key, next_run
-
-    grace = timedelta(minutes=SCHEDULE_GRACE_MINUTES)
     candidates = [
         now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         for hour, minute in value
@@ -237,16 +225,13 @@ def scheduler_next_display(now: datetime | None = None) -> datetime:
     mode, value = parse_schedule(read_schedule())
 
     if mode == "interval":
-        saved = read_next_auto_run()
-        if saved and saved > now:
-            return saved
-
-        candidate = now + timedelta(hours=value)
-        write_next_auto_run(candidate)
+        slot = interval_slot_at_or_before(now, value)
+        candidate = slot + timedelta(hours=value)
+        if candidate <= now:
+            candidate += timedelta(hours=value)
         return candidate
 
     return next_auto_run(now)
-
 
 
 def read_promo_text() -> str:
@@ -270,26 +255,22 @@ def read_message_id(path: Path):
 
 
 def is_auto_send_enabled() -> bool:
-    if AUTO_SEND_ENABLED_FILE.exists():
-        value = AUTO_SEND_ENABLED_FILE.read_text(encoding="utf-8").strip().lower()
-        return value in {"1", "true", "yes", "on"}
-    return AUTO_SEND_DEFAULT
+    return auto_send_enabled_runtime
 
 
 def set_auto_send_enabled(enabled: bool) -> None:
-    AUTO_SEND_ENABLED_FILE.write_text("true" if enabled else "false", encoding="utf-8")
+    global auto_send_enabled_runtime
+    auto_send_enabled_runtime = bool(enabled)
 
 
 def read_schedule() -> str:
-    if SCHEDULE_FILE.exists():
-        value = SCHEDULE_FILE.read_text(encoding="utf-8").strip()
-        if value:
-            return value
-    return DEFAULT_SCHEDULE
+    return schedule_runtime
 
 
 def write_schedule(value: str) -> None:
-    SCHEDULE_FILE.write_text(value, encoding="utf-8")
+    global schedule_runtime
+    parse_schedule(value)
+    schedule_runtime = value
 
 
 def parse_schedule(value: str):
@@ -948,10 +929,6 @@ async def automatic_scheduler():
             # 작업 생성이 성공한 후에만 이번 회차 완료 표시와 다음 예약을 저장합니다.
             write_last_auto_slot(slot_key)
 
-            mode, value = parse_schedule(read_schedule())
-            if mode == "interval":
-                write_next_auto_run(next_run)
-
             last_logged_next = None
 
             # 시작 알림은 발송 작업과 분리해 알림 오류가 실제 발송을 막지 못하게 합니다.
@@ -1030,7 +1007,17 @@ async def handle_control_message(event):
     if command.startswith("/"):
         logger.info("명령 수신: %s", command)
 
-    if command == "/ping":
+    if command == "/configenv":
+        enabled_value = "true" if is_auto_send_enabled() else "false"
+        await event.respond(
+            "⚙️ Railway 권장 환경변수\n"
+            f"AUTO_SEND_ENABLED={enabled_value}\n"
+            f"AUTO_SEND_SCHEDULE={read_schedule()}\n\n"
+            "Railway → Variables에 위 값을 저장하면 "
+            "재배포 후에도 같은 설정으로 시작합니다."
+        )
+
+    elif command == "/ping":
         await event.respond("✅ 프로그램이 정상 작동 중입니다.")
 
     elif command == "/help":
@@ -1050,6 +1037,7 @@ async def handle_control_message(event):
             "/autooff - 자동 발송 끄기\n"
             "/schedule 6h - 6시간마다 발송\n"
             "/schedule 08:00 14:00 20:00 - 지정 시간 발송\n"
+            "/configenv - Railway 환경변수 값 확인\n"
             "/ping - 프로그램 응답 확인\n"
             "/help - 도움말\n\n"
             "파일 업데이트\n"
@@ -1092,14 +1080,7 @@ async def handle_control_message(event):
 
     elif command == "/autoon":
         set_auto_send_enabled(True)
-        mode, value = parse_schedule(read_schedule())
-
-        if mode == "interval":
-            next_run = datetime.now(KST) + timedelta(hours=value)
-            write_next_auto_run(next_run)
-        else:
-            next_run = next_auto_run()
-
+        next_run = scheduler_next_display()
         await event.respond(
             "✅ 자동 발송을 켰습니다.\n"
             f"일정: {schedule_description()}\n"
@@ -1136,18 +1117,11 @@ async def handle_control_message(event):
                 write_schedule("times:" + ",".join(parsed_times))
 
             set_auto_send_enabled(True)
-            NEXT_AUTO_RUN_FILE.unlink(missing_ok=True)
-            LAST_AUTO_SLOT_FILE.unlink(missing_ok=True)
-
-            mode, value = parse_schedule(read_schedule())
-            if mode == "interval":
-                next_run = datetime.now(KST) + timedelta(hours=value)
-                write_next_auto_run(next_run)
-            else:
-                next_run = next_auto_run()
+            write_last_auto_slot("")
+            next_run = scheduler_next_display()
 
             await event.respond(
-                "✅ 자동 발송 일정을 저장하고 자동 발송을 켰습니다.\n"
+                "✅ 자동 발송 일정을 적용하고 자동 발송을 켰습니다.\n"
                 f"일정: {schedule_description()}\n"
                 f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}\n"
                 "변경된 일정은 최대 "
@@ -1369,7 +1343,7 @@ async def main():
         else "자동 발송 꺼짐"
     )
     await safe_control_message(
-        "✅ 홍보 프로그램 안정판 v2가 실행되었습니다.\n"
+        "✅ 홍보 프로그램 안정판 v3가 실행되었습니다.\n"
         "저장한 메시지에 /help를 입력하세요.\n"
         f"자동 발송: {auto_status}\n"
         f"일정: {schedule_description()}\n"
