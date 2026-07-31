@@ -21,7 +21,7 @@ logger = logging.getLogger("promo")
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"].strip()
 STRING_SESSION = os.environ["STRING_SESSION"].strip()
-SEND_INTERVAL = max(10, int(os.getenv("SEND_INTERVAL", "10")))
+SEND_INTERVAL = max(30, int(os.getenv("SEND_INTERVAL", "30")))
 SEND_TIMEOUT = max(30, int(os.getenv("SEND_TIMEOUT", "60")))
 MAX_FLOOD_WAIT = max(0, int(os.getenv("MAX_FLOOD_WAIT", "30")))
 PROMO_TEXT_FILE = Path(os.getenv("PROMO_TEXT_FILE", "promo.txt"))
@@ -461,6 +461,30 @@ async def control_message(text: str):
     await client.send_message("me", text)
 
 
+async def safe_event_respond(event, text: str) -> bool:
+    """명령어 답변이 FloodWait에 걸려도 프로그램 전체가 오류로 끝나지 않게 합니다."""
+    try:
+        await asyncio.wait_for(
+            event.respond(text),
+            timeout=SEND_TIMEOUT,
+        )
+        return True
+
+    except FloodWaitError as exc:
+        logger.warning(
+            "명령 응답 FloodWait %s초 - 답변만 생략",
+            int(exc.seconds),
+        )
+
+    except asyncio.TimeoutError:
+        logger.warning("명령 응답 시간 초과 - 답변만 생략")
+
+    except Exception as exc:
+        logger.exception("명령 응답 실패 - 답변만 생략: %s", exc)
+
+    return False
+
+
 async def safe_control_message(text: str) -> bool:
     """알림 전송 실패가 발송 작업이나 자동 스케줄러를 멈추지 않도록 보호합니다."""
     try:
@@ -544,29 +568,29 @@ async def save_uploaded_file(event) -> bool:
         if destination == TARGETS_FILE:
             try:
                 count = len(read_targets())
-                await event.respond(f"✅ targets.txt 업데이트 완료\n발송 대상: {count}개")
+                await safe_event_respond(event, f"✅ targets.txt 업데이트 완료\n발송 대상: {count}개")
             except Exception as exc:
-                await event.respond(f"⚠️ targets.txt는 저장됐지만 확인이 필요합니다.\n{exc}")
+                await safe_event_respond(event, f"⚠️ targets.txt는 저장됐지만 확인이 필요합니다.\n{exc}")
         elif destination == PROMO_TEXT_FILE:
             try:
                 text_length = len(read_promo_text())
-                await event.respond(f"✅ promo.txt 업데이트 완료\n문자 수: {text_length}자")
+                await safe_event_respond(event, f"✅ promo.txt 업데이트 완료\n문자 수: {text_length}자")
             except Exception as exc:
-                await event.respond(f"⚠️ promo.txt는 저장됐지만 확인이 필요합니다.\n{exc}")
+                await safe_event_respond(event, f"⚠️ promo.txt는 저장됐지만 확인이 필요합니다.\n{exc}")
         else:
-            await event.respond("✅ promo.jpg 업데이트 완료")
+            await safe_event_respond(event, "✅ promo.jpg 업데이트 완료")
 
         logger.info("업로드 파일 저장 완료: %s", destination)
         return True
 
     except UnicodeDecodeError:
         temp_file.unlink(missing_ok=True)
-        await event.respond("❌ 텍스트 파일은 UTF-8 형식으로 저장해서 다시 보내주세요.")
+        await safe_event_respond(event, "❌ 텍스트 파일은 UTF-8 형식으로 저장해서 다시 보내주세요.")
         return True
     except Exception as exc:
         temp_file.unlink(missing_ok=True)
         logger.exception("파일 업데이트 실패: %s", exc)
-        await event.respond(f"❌ 파일 업데이트 실패\n{exc}")
+        await safe_event_respond(event, f"❌ 파일 업데이트 실패\n{exc}")
         return True
 
 
@@ -979,11 +1003,11 @@ async def handle_control_message(event):
 
         if command_preview == "/cancel":
             waiting_for_promo = None
-            await event.respond("❎ 홍보 메시지 저장을 취소했습니다.")
+            await safe_event_respond(event, "❎ 홍보 메시지 저장을 취소했습니다.")
             return
 
         if command_preview.startswith("/") and not event.media:
-            await event.respond(
+            await safe_event_respond(event, 
                 "⚠️ 지금은 홍보 메시지를 기다리고 있습니다. 취소하려면 /cancel을 입력하세요."
             )
             return
@@ -993,13 +1017,13 @@ async def handle_control_message(event):
             saved_label = "사진+텍스트 홍보 메시지"
         else:
             if event.media:
-                await event.respond(
+                await safe_event_respond(event, 
                     "❌ /setpromo2에는 사진 없이 텍스트만 보내주세요.\n"
                     "다시 텍스트 메시지를 보내거나 /cancel을 입력하세요."
                 )
                 return
             if not event.raw_text.strip():
-                await event.respond(
+                await safe_event_respond(event, 
                     "❌ 텍스트 문구가 비어 있습니다. 다시 보내거나 /cancel을 입력하세요."
                 )
                 return
@@ -1007,7 +1031,7 @@ async def handle_control_message(event):
             saved_label = "텍스트 전용 홍보 메시지"
 
         waiting_for_promo = None
-        await event.respond(
+        await safe_event_respond(event, 
             f"✅ {saved_label}를 저장했습니다.\n"
             "이제 /send 한 번으로 사진 가능 그룹에는 사진+텍스트, "
             "사진 제한 그룹에는 텍스트만 자동 발송합니다."
@@ -1023,7 +1047,7 @@ async def handle_control_message(event):
 
     if command == "/configenv":
         enabled_value = "true" if is_auto_send_enabled() else "false"
-        await event.respond(
+        await safe_event_respond(event, 
             "⚙️ Railway 권장 환경변수\n"
             f"AUTO_SEND_ENABLED={enabled_value}\n"
             f"AUTO_SEND_SCHEDULE={read_schedule()}\n\n"
@@ -1032,10 +1056,10 @@ async def handle_control_message(event):
         )
 
     elif command == "/ping":
-        await event.respond("✅ 프로그램이 정상 작동 중입니다.")
+        await safe_event_respond(event, "✅ 프로그램이 정상 작동 중입니다.")
 
     elif command == "/help":
-        await event.respond(
+        await safe_event_respond(event, 
             "명령어\n"
             "/scan - 가입한 그룹 목록 만들기\n"
             "/send - 전체 발송 시작\n"
@@ -1064,13 +1088,14 @@ async def handle_control_message(event):
             "3. /send 또는 자동 일정으로 발송\n"
             "사진 제한 그룹에는 텍스트 전용 홍보가 자동 전송됩니다.\n"
             "긴 Telegram 대기 제한이 발생하면 해당 그룹만 실패 처리하고 다음 그룹으로 진행합니다.\n"
+            f"현재 그룹 간 발송 간격: {SEND_INTERVAL}초\n"
             f"현재 자동 일정: {schedule_description()}\n"
             "명령어와 파일은 텔레그램 '저장한 메시지'에 보내세요."
         )
 
     elif command in {"/setpromo", "/setpromo1"}:
         waiting_for_promo = "promo1"
-        await event.respond(
+        await safe_event_respond(event, 
             "🖼 다음에 보내는 메시지를 사진+텍스트 홍보 원본으로 저장합니다.\n"
             "사진, 텍스트, 굵게, 링크, 프리미엄 커스텀 이모지를 포함해 보내세요.\n"
             "취소하려면 /cancel을 입력하세요."
@@ -1078,7 +1103,7 @@ async def handle_control_message(event):
 
     elif command == "/setpromo2":
         waiting_for_promo = "promo2"
-        await event.respond(
+        await safe_event_respond(event, 
             "📝 다음에 보내는 메시지를 텍스트 전용 홍보 원본으로 저장합니다.\n"
             "사진 없이 텍스트, 굵게, 링크, 프리미엄 커스텀 이모지만 보내세요.\n"
             "취소하려면 /cancel을 입력하세요."
@@ -1087,7 +1112,7 @@ async def handle_control_message(event):
     elif command == "/clearpromo":
         PROMO1_MESSAGE_ID_FILE.unlink(missing_ok=True)
         PROMO2_MESSAGE_ID_FILE.unlink(missing_ok=True)
-        await event.respond(
+        await safe_event_respond(event, 
             "✅ 사진+텍스트 및 텍스트 전용 홍보 원본을 모두 삭제했습니다. "
             "이제 promo.txt/promo.jpg를 사용합니다."
         )
@@ -1097,17 +1122,18 @@ async def handle_control_message(event):
         initialize_schedule_runtime()
         next_run = scheduler_next_display()
 
-        await event.respond(
+        await safe_event_respond(event, 
             "✅ 자동 발송을 켰습니다.\n"
             f"일정: {schedule_description()}\n"
             f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}\n"
-            f"스케줄러 확인 간격: {SCHEDULER_POLL_SECONDS}초"
+            f"스케줄러 확인 간격: {SCHEDULER_POLL_SECONDS}초\n"
+        f"그룹 간 발송 간격: {SEND_INTERVAL}초"
         )
 
     elif command.startswith("/schedule"):
         parts = command.split()
         if len(parts) < 2:
-            await event.respond(
+            await safe_event_respond(event, 
                 "사용 예시\n"
                 "/schedule 6h\n"
                 "/schedule 08:00 14:00 20:00"
@@ -1135,7 +1161,7 @@ async def handle_control_message(event):
             set_auto_send_enabled(True)
             next_run = scheduler_next_display()
 
-            await event.respond(
+            await safe_event_respond(event, 
                 "✅ 자동 발송 일정을 적용하고 자동 발송을 켰습니다.\n"
                 f"일정: {schedule_description()}\n"
                 f"다음 발송: {next_run.strftime('%Y-%m-%d %H:%M KST')}\n"
@@ -1143,7 +1169,7 @@ async def handle_control_message(event):
                 f"{SCHEDULER_POLL_SECONDS}초 안에 반영됩니다."
             )
         except Exception:
-            await event.respond(
+            await safe_event_respond(event, 
                 "❌ 일정 형식이 올바르지 않습니다.\n"
                 "예시: /schedule 6h\n"
                 "예시: /schedule 08:00 14:00 20:00"
@@ -1151,10 +1177,10 @@ async def handle_control_message(event):
 
     elif command == "/autooff":
         set_auto_send_enabled(False)
-        await event.respond("⏸ 자동 발송을 껐습니다. 수동 /send는 계속 사용할 수 있습니다.")
+        await safe_event_respond(event, "⏸ 자동 발송을 껐습니다. 수동 /send는 계속 사용할 수 있습니다.")
 
     elif command == "/scan":
-        await event.respond("🔎 그룹 목록을 확인하고 있습니다...")
+        await safe_event_respond(event, "🔎 그룹 목록을 확인하고 있습니다...")
         try:
             output = await scan_groups()
             await client.send_file(
@@ -1163,33 +1189,33 @@ async def handle_control_message(event):
                 caption="가입한 그룹 목록입니다. 게시가 허용된 그룹만 대상에 넣으세요.",
             )
         except Exception as exc:
-            await event.respond(f"❌ 그룹 스캔 실패\n{exc}")
+            await safe_event_respond(event, f"❌ 그룹 스캔 실패\n{exc}")
 
     elif command == "/send":
         if send_task and not send_task.done():
-            await event.respond("⚠️ 이미 발송 중입니다.")
+            await safe_event_respond(event, "⚠️ 이미 발송 중입니다.")
             return
         send_task = asyncio.create_task(send_promotions())
 
     elif command in {"/retry", "/retry_failed"}:
         if send_task and not send_task.done():
-            await event.respond("⚠️ 이미 발송 중입니다.")
+            await safe_event_respond(event, "⚠️ 이미 발송 중입니다.")
             return
 
         try:
             retry_targets = read_failed_targets()
         except Exception as exc:
-            await event.respond(f"❌ 재발송할 수 없습니다.\n{exc}")
+            await safe_event_respond(event, f"❌ 재발송할 수 없습니다.\n{exc}")
             return
 
-        await event.respond(f"🔄 실패 그룹 재발송 준비\n대상: {len(retry_targets)}개")
+        await safe_event_respond(event, f"🔄 실패 그룹 재발송 준비\n대상: {len(retry_targets)}개")
         send_task = asyncio.create_task(
             send_promotions(retry_targets, "실패 그룹 재발송")
         )
 
     elif command == "/stop":
         stop_requested = True
-        await event.respond("⏹ 중지 요청을 받았습니다. 현재 작업 후 멈춥니다.")
+        await safe_event_respond(event, "⏹ 중지 요청을 받았습니다. 현재 작업 후 멈춥니다.")
 
     elif command == "/status":
         running = bool(send_task and not send_task.done())
@@ -1224,7 +1250,7 @@ async def handle_control_message(event):
             else "기록 없음"
         )
 
-        await event.respond(
+        await safe_event_respond(event, 
             f"상태: {'발송 중' if running else '대기 중'}\n"
             f"{progress_line}"
             f"마지막 종료: {finished_line}\n"
@@ -1251,7 +1277,7 @@ async def handle_control_message(event):
             else:
                 next_line = "자동 발송 꺼짐"
 
-            await event.respond(
+            await safe_event_respond(event, 
                 "📋 현재 진행 중인 발송이 없습니다.\n"
                 f"마지막 상태: {last_run_status}\n"
                 f"마지막 결과: 성공 {progress_success}개 / "
@@ -1285,7 +1311,7 @@ async def handle_control_message(event):
         else:
             estimated_seconds = remaining * SEND_INTERVAL
 
-        await event.respond(
+        await safe_event_respond(event, 
             "📊 현재 발송 진행률\n"
             f"진행: {progress_current}/{progress_total} ({percent}%)\n"
             f"성공: {progress_success}개\n"
@@ -1316,7 +1342,7 @@ async def handle_control_message(event):
         except Exception:
             failed_status = "없음"
 
-        await event.respond(
+        await safe_event_respond(event, 
             "📁 현재 파일 상태\n"
             f"targets.txt: {targets_status}\n"
             f"promo.txt: {promo_status}\n"
@@ -1346,7 +1372,7 @@ async def control_handler(event):
     except Exception as exc:
         logger.exception("명령 처리 오류: %s", exc)
         try:
-            await event.respond(
+            await safe_event_respond(event, 
                 "❌ 명령 처리 중 오류가 발생했습니다.\n"
                 f"{type(exc).__name__}: {exc}"
             )
@@ -1371,7 +1397,7 @@ async def main():
         else "자동 발송 꺼짐"
     )
     await safe_control_message(
-        "✅ 홍보 프로그램 단순 스케줄러 v4.1이 실행되었습니다.\n"
+        "✅ 홍보 프로그램 안정판 v5가 실행되었습니다.\n"
         "저장한 메시지에 /help를 입력하세요.\n"
         f"자동 발송: {auto_status}\n"
         f"일정: {schedule_description()}\n"
